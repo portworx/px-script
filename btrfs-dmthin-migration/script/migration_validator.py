@@ -79,6 +79,48 @@ class STCConfig:
         'google': ['pd-ssd'],  # Another alternative
         'vsphere': ['eagerzeroedthick', 'lazyzeroedthick', 'thin']
     })
+    
+    # Maximum drives per node by cloud provider
+    # StoreV2 migration requires sufficient disk slots for new drives
+    max_drives_per_node: Dict[str, int] = field(default_factory=lambda: {
+        'aws': 8,
+        'azure': 8,
+        'gce': 8,
+        'gke': 8,
+        'google': 8,
+        'ibm': 8,
+        'vsphere': 12,
+        'pure': 32
+    })
+    
+    # Default max drives for unknown providers
+    default_max_drives_per_node: int = 8
+    
+    # Default max drives per pool
+    max_drives_per_pool: int = 6
+    
+    # StoreV2 node resource requirements
+    # Minimum: 8 CPU cores, 8 GB RAM
+    # Recommended: 16 CPU cores, 16 GB RAM
+    storev2_min_cpu_cores: int = 8
+    storev2_min_memory_gb: float = 8.0
+    storev2_recommended_cpu_cores: int = 16
+    storev2_recommended_memory_gb: float = 16.0
+    
+    # Small config (TNA - Two-Node with Arbiter) resource requirements
+    # When small_conf=1 is present in misc-args, arbiter node has lower requirements
+    # Arbiter node: 4 CPU cores, 4 GB RAM
+    # Storage nodes still require standard minimums (8 CPU, 8 GB)
+    small_conf_min_cpu_cores: int = 4
+    small_conf_min_memory_gb: float = 4.0
+    
+    # License requirements for StoreV2 migration
+    # Trial licenses are not allowed for migration
+    # Volume attachment limits per node:
+    #   - Licensed: 1024 attachments
+    #   - Trial: 100 attachments
+    licensed_volume_attachments_per_node: int = 1024
+    trial_volume_attachments_per_node: int = 100
 
 
 class STCDataRetriever:
@@ -123,6 +165,115 @@ class STCDataRetriever:
             logger.error(error_msg)
             raise RuntimeError(error_msg)
 
+    def get_portworx_pod_health(self) -> Dict[str, Any]:
+        """Get health status of all Portworx pods including container readiness"""
+        namespace = self.get_namespace()
+
+        try:
+            # Get detailed pod info in JSON format
+            cmd = ['kubectl', '-n', namespace, 'get', 'pods', '-l', 'name=portworx',
+                   '-o', 'json']
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30
+            )
+
+            pods_data = json.loads(result.stdout)
+            pod_health = {
+                'total': 0,
+                'ready': [],
+                'not_ready': [],
+                'details': {}
+            }
+
+            for pod in pods_data.get('items', []):
+                pod_name = pod.get('metadata', {}).get('name', '')
+                pod_phase = pod.get('status', {}).get('phase', 'Unknown')
+                
+                pod_health['total'] += 1
+                
+                # Check container statuses for the 'portworx' container
+                container_statuses = pod.get('status', {}).get('containerStatuses', [])
+                portworx_container_ready = False
+                portworx_container_state = 'Not Found'
+                
+                for container in container_statuses:
+                    if container.get('name') == 'portworx':
+                        portworx_container_ready = container.get('ready', False)
+                        state = container.get('state', {})
+                        if 'running' in state:
+                            portworx_container_state = 'Running'
+                        elif 'waiting' in state:
+                            reason = state['waiting'].get('reason', 'Unknown')
+                            portworx_container_state = f'Waiting ({reason})'
+                        elif 'terminated' in state:
+                            reason = state['terminated'].get('reason', 'Unknown')
+                            portworx_container_state = f'Terminated ({reason})'
+                        break
+                
+                pod_health['details'][pod_name] = {
+                    'phase': pod_phase,
+                    'portworx_container_ready': portworx_container_ready,
+                    'portworx_container_state': portworx_container_state
+                }
+                
+                # A pod is considered ready if phase is Running AND portworx container is ready
+                if pod_phase == 'Running' and portworx_container_ready:
+                    pod_health['ready'].append(pod_name)
+                else:
+                    pod_health['not_ready'].append(pod_name)
+
+            return pod_health
+
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to get Portworx pod health: {e.stderr}")
+            return {'total': 0, 'ready': [], 'not_ready': [], 'details': {}}
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse pod health JSON: {e}")
+            return {'total': 0, 'ready': [], 'not_ready': [], 'details': {}}
+
+    def get_ready_portworx_pods(self) -> Tuple[List[str], Dict[str, Any]]:
+        """Get list of ready Portworx pods with health info
+        
+        Returns:
+            Tuple of (list of ready pod names, full health info dict)
+        """
+        pod_health = self.get_portworx_pod_health()
+        
+        if pod_health['total'] == 0:
+            raise RuntimeError("No Portworx pods found with label 'name=portworx'")
+        
+        if not pod_health['ready']:
+            # Build detailed error message
+            not_ready_details = []
+            for pod_name in pod_health['not_ready']:
+                details = pod_health['details'].get(pod_name, {})
+                not_ready_details.append(
+                    f"  - {pod_name}: Phase={details.get('phase', 'Unknown')}, "
+                    f"Container={details.get('portworx_container_state', 'Unknown')}"
+                )
+            
+            error_msg = (
+                f"No healthy Portworx pods available. "
+                f"All {pod_health['total']} pod(s) have containers not ready:\n" +
+                "\n".join(not_ready_details)
+            )
+            raise RuntimeError(error_msg)
+        
+        logger.info(f"Found {len(pod_health['ready'])} ready Portworx pods out of {pod_health['total']} total")
+        
+        if pod_health['not_ready']:
+            logger.warning(
+                f"{len(pod_health['not_ready'])} Portworx pod(s) are not ready: "
+                f"{', '.join(pod_health['not_ready'][:3])}{'...' if len(pod_health['not_ready']) > 3 else ''}"
+            )
+        
+        return pod_health['ready'], pod_health
+
     def exec_pxctl_command(self, pod_name: str, command: List[str]) -> str:
         """Execute pxctl command on a Portworx pod"""
         namespace = self.get_namespace()
@@ -158,17 +309,31 @@ class STCDataRetriever:
                 'pools': {},
                 'cluster_id': None,
                 'cluster_uuid': None
+            },
+            'license': {
+                'type': None,
+                'is_trial': False,
+                'expiry_info': None
             }
         }
 
         lines = pxctl_output.split('\n')
 
-        # Parse cluster ID and UUID
+        # Parse cluster ID, UUID, and License
         for line in lines:
             if 'Cluster ID:' in line:
                 data['status']['cluster_id'] = line.split(':', 1)[1].strip()
             elif 'Cluster UUID:' in line:
                 data['status']['cluster_uuid'] = line.split(':', 1)[1].strip()
+            elif line.strip().startswith('License:'):
+                license_str = line.split(':', 1)[1].strip()
+                data['license']['type'] = license_str
+                # Check if trial license
+                if 'trial' in license_str.lower():
+                    data['license']['is_trial'] = True
+                    # Extract expiry info if present (e.g., "Trial (expires in 30 days)")
+                    if 'expires' in license_str.lower():
+                        data['license']['expiry_info'] = license_str
 
         # Parse global storage pool
         for i, line in enumerate(lines):
@@ -238,6 +403,88 @@ class STCDataRetriever:
         logger.info(f"Parsed {nodes_parsed} storage nodes from pxctl status")
 
         return data
+
+    def parse_pxctl_drive_show(self, pxctl_output: str) -> Dict[str, Any]:
+        """Parse pxctl service drive show output to get drive information"""
+        drive_info = {
+            'total_drives': 0,
+            'drives': [],
+            'pool_drive_counts': {}  # Pool ID -> drive count
+        }
+
+        lines = pxctl_output.split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Look for drive entries - typically formatted as:
+            # /dev/sdb or similar device paths, or table rows with drive info
+            # Common format: "Device   Path   Pool ID   ..."
+            # Or: "/dev/sdb   150 GiB   0   Online"
+            
+            # Skip header lines
+            if line.startswith('Device') or line.startswith('Path') or line.startswith('-'):
+                continue
+            
+            # Check if line contains a device path (starts with /dev/ or contains drive info)
+            if '/dev/' in line or line.startswith('Drive'):
+                drive_info['total_drives'] += 1
+                
+                # Try to extract pool ID from the line
+                parts = line.split()
+                for i, part in enumerate(parts):
+                    if part.isdigit() and i > 0:  # Pool ID is usually a small number
+                        pool_id = part
+                        if pool_id not in drive_info['pool_drive_counts']:
+                            drive_info['pool_drive_counts'][pool_id] = 0
+                        drive_info['pool_drive_counts'][pool_id] += 1
+                        break
+                
+                # Store drive path
+                for part in parts:
+                    if '/dev/' in part:
+                        drive_info['drives'].append(part)
+                        break
+
+        return drive_info
+
+    def get_node_drive_info(self, ready_pods: List[str], pod_to_node_map: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+        """Get drive information for each node using pxctl service drive show
+        
+        Args:
+            ready_pods: List of ready pod names
+            pod_to_node_map: Mapping of pod names to node names
+            
+        Returns:
+            Dict mapping node names to their drive information
+        """
+        node_drive_info = {}
+        
+        for pod_name in ready_pods:
+            try:
+                drive_output = self.exec_pxctl_command(pod_name, ['service', 'drive', 'show'])
+                drive_info = self.parse_pxctl_drive_show(drive_output)
+                
+                # Map pod to node name if available
+                node_name = pod_to_node_map.get(pod_name, pod_name)
+                node_drive_info[node_name] = drive_info
+                
+                logger.info(f"Node {node_name}: {drive_info['total_drives']} drive(s) detected")
+                
+            except Exception as e:
+                logger.warning(f"Failed to get drive info from pod {pod_name}: {e}")
+                # Store empty info on failure
+                node_name = pod_to_node_map.get(pod_name, pod_name)
+                node_drive_info[node_name] = {
+                    'total_drives': 0,
+                    'drives': [],
+                    'pool_drive_counts': {},
+                    'error': str(e)
+                }
+        
+        return node_drive_info
 
     def parse_pxctl_pool_show(self, pxctl_output: str, current_node: str) -> Dict[str, Any]:
         """Parse pxctl sv pool show output"""
@@ -341,17 +588,28 @@ class STCDataRetriever:
         try:
             logger.info(f"Retrieving Portworx data from namespace: {namespace}")
 
-            # Get Portworx pods
-            pods = self.get_portworx_pods()
+            # Get ready Portworx pods (validates health first)
+            ready_pods, pod_health = self.get_ready_portworx_pods()
 
-            # Execute pxctl status on first available pod to get cluster-wide data
+            # Execute pxctl status on first available ready pod to get cluster-wide data
             logger.info("Collecting cluster-wide status...")
-            pxctl_status_output = self.exec_pxctl_command(pods[0], ['status'])
+            pxctl_status_output = self.exec_pxctl_command(ready_pods[0], ['status'])
             stc_data = self.parse_pxctl_status(pxctl_status_output)
+            
+            # Store pod health info in stc_data for reporting
+            stc_data['pod_health'] = pod_health
 
-            # Collect pool information from each node
+            # Build pod to node mapping for drive info collection
+            pod_to_node_map = {}
+            for node_name in stc_data['status']['nodes'].keys():
+                for pod in ready_pods:
+                    if node_name in pod or pod in node_name:
+                        pod_to_node_map[pod] = node_name
+                        break
+
+            # Collect pool information from each ready node
             logger.info("Collecting pool information from each node...")
-            for pod in pods:
+            for pod in ready_pods:
                 try:
                     pool_output = self.exec_pxctl_command(pod, ['sv', 'pool', 'show'])
                     node_pools = self.parse_pxctl_pool_show(pool_output, pod)
@@ -366,11 +624,30 @@ class STCDataRetriever:
                                 node_data['pools'].append(pool_name)
                                 # Copy pool labels to node
                                 node_data['labels'].update(pool_data.get('labels', {}))
+                                # Update pod_to_node_map if not already mapped
+                                if pod not in pod_to_node_map:
+                                    pod_to_node_map[pod] = node_name
                                 break
 
                 except Exception as e:
                     logger.warning(f"Failed to get pool info from pod {pod}: {e}")
                     continue
+
+            # Collect drive information from each node
+            logger.info("Collecting drive information from each node...")
+            node_drive_info = self.get_node_drive_info(ready_pods, pod_to_node_map)
+            stc_data['node_drive_info'] = node_drive_info
+
+            # Collect node CPU and memory resources
+            logger.info("Collecting node CPU and memory resources...")
+            px_nodes = list(stc_data['status']['nodes'].keys())
+            node_resources = self.retrieve_node_resources(px_nodes)
+            stc_data['node_resources'] = node_resources
+
+            # Collect volume attachments per node
+            logger.info("Collecting volume attachments per node...")
+            volume_attachments = self.retrieve_volume_attachments_per_node(px_nodes)
+            stc_data['volume_attachments'] = volume_attachments
 
             logger.info("Successfully retrieved and parsed Portworx data")
             return stc_data
@@ -477,6 +754,199 @@ class STCDataRetriever:
             logger.warning(f"Error retrieving Kubernetes node labels: {e}")
             return {}
 
+    def _parse_memory_to_gb(self, mem_str: str) -> float:
+        """Parse Kubernetes memory string (e.g., '16384Ki', '16Gi') to GB"""
+        if not mem_str:
+            return 0.0
+        
+        mem_str = mem_str.strip()
+        
+        try:
+            if mem_str.endswith('Ki'):
+                return float(mem_str[:-2]) / (1024 * 1024)
+            elif mem_str.endswith('Mi'):
+                return float(mem_str[:-2]) / 1024
+            elif mem_str.endswith('Gi'):
+                return float(mem_str[:-2])
+            elif mem_str.endswith('Ti'):
+                return float(mem_str[:-2]) * 1024
+            elif mem_str.endswith('K'):
+                return float(mem_str[:-1]) / (1000 * 1000)
+            elif mem_str.endswith('M'):
+                return float(mem_str[:-1]) / 1000
+            elif mem_str.endswith('G'):
+                return float(mem_str[:-1])
+            elif mem_str.endswith('T'):
+                return float(mem_str[:-1]) * 1000
+            else:
+                # Assume bytes
+                return float(mem_str) / (1024 * 1024 * 1024)
+        except (ValueError, TypeError):
+            logger.warning(f"Failed to parse memory value: {mem_str}")
+            return 0.0
+
+    def _parse_cpu_to_cores(self, cpu_str: str) -> float:
+        """Parse Kubernetes CPU string (e.g., '4', '4000m') to cores"""
+        if not cpu_str:
+            return 0.0
+        
+        cpu_str = cpu_str.strip()
+        
+        try:
+            if cpu_str.endswith('m'):
+                return float(cpu_str[:-1]) / 1000
+            else:
+                return float(cpu_str)
+        except (ValueError, TypeError):
+            logger.warning(f"Failed to parse CPU value: {cpu_str}")
+            return 0.0
+
+    def retrieve_node_resources(self, px_nodes: List[str] = None) -> Dict[str, Dict[str, Any]]:
+        """Retrieve CPU and memory resources for Kubernetes nodes
+        
+        Args:
+            px_nodes: List of node names to retrieve resources for. If None, retrieves for all Portworx nodes.
+            
+        Returns:
+            Dict mapping node names to their resource info:
+            {
+                'node-name': {
+                    'capacity': {'cpu': 16, 'memory_gb': 64.0},
+                    'allocatable': {'cpu': 15.5, 'memory_gb': 62.0}
+                }
+            }
+        """
+        try:
+            logger.info("Retrieving node CPU and memory resources...")
+            
+            # Get Portworx nodes if not provided
+            if px_nodes is None:
+                px_nodes = self.retrieve_portworx_nodes()
+            
+            if not px_nodes:
+                logger.warning("No Portworx nodes found for resource check")
+                return {}
+            
+            # Get all nodes in JSON format
+            cmd = ['kubectl', 'get', 'nodes', '-o', 'json']
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30
+            )
+            
+            nodes_data = json.loads(result.stdout)
+            node_resources = {}
+            
+            for node in nodes_data.get('items', []):
+                node_name = node.get('metadata', {}).get('name', '')
+                
+                if node_name not in px_nodes:
+                    continue
+                
+                status = node.get('status', {})
+                capacity = status.get('capacity', {})
+                allocatable = status.get('allocatable', {})
+                
+                node_resources[node_name] = {
+                    'capacity': {
+                        'cpu': self._parse_cpu_to_cores(capacity.get('cpu', '0')),
+                        'memory_gb': self._parse_memory_to_gb(capacity.get('memory', '0'))
+                    },
+                    'allocatable': {
+                        'cpu': self._parse_cpu_to_cores(allocatable.get('cpu', '0')),
+                        'memory_gb': self._parse_memory_to_gb(allocatable.get('memory', '0'))
+                    }
+                }
+            
+            logger.info(f"Retrieved resource info for {len(node_resources)} nodes")
+            return node_resources
+            
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Failed to get node resources: {e.stderr}")
+            return {}
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse node resources JSON: {e}")
+            return {}
+        except Exception as e:
+            logger.warning(f"Error retrieving node resources: {e}")
+            return {}
+
+    def retrieve_volume_attachments_per_node(self, px_nodes: List[str] = None) -> Dict[str, Dict[str, Any]]:
+        """Retrieve volume attachment counts per node using Kubernetes VolumeAttachment objects
+        
+        Args:
+            px_nodes: List of node names to retrieve attachments for. If None, retrieves for all nodes.
+            
+        Returns:
+            Dict mapping node names to their attachment info:
+            {
+                'node-name': {
+                    'total_attachments': 25,
+                    'attached': 20,
+                    'attaching': 5
+                }
+            }
+        """
+        try:
+            logger.info("Retrieving volume attachments per node...")
+            
+            # Get all VolumeAttachments
+            cmd = ['kubectl', 'get', 'volumeattachments.storage.k8s.io', '-o', 'json']
+            
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=60
+            )
+            
+            attachments_data = json.loads(result.stdout)
+            node_attachments = {}
+            
+            for attachment in attachments_data.get('items', []):
+                node_name = attachment.get('spec', {}).get('nodeName', '')
+                
+                if not node_name:
+                    continue
+                
+                # Filter to px_nodes if provided
+                if px_nodes and node_name not in px_nodes:
+                    continue
+                
+                if node_name not in node_attachments:
+                    node_attachments[node_name] = {
+                        'total_attachments': 0,
+                        'attached': 0,
+                        'attaching': 0
+                    }
+                
+                node_attachments[node_name]['total_attachments'] += 1
+                
+                # Check attachment status
+                status = attachment.get('status', {})
+                if status.get('attached', False):
+                    node_attachments[node_name]['attached'] += 1
+                else:
+                    node_attachments[node_name]['attaching'] += 1
+            
+            logger.info(f"Retrieved volume attachment info for {len(node_attachments)} nodes")
+            return node_attachments
+            
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Failed to get volume attachments: {e.stderr}")
+            return {}
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse volume attachments JSON: {e}")
+            return {}
+        except Exception as e:
+            logger.warning(f"Error retrieving volume attachments: {e}")
+            return {}
+
     def retrieve_stc_spec(self) -> Dict[str, Any]:
         """Retrieve StorageCluster spec via kubectl to get cloudStorage configuration"""
         namespace = self.get_namespace()
@@ -540,6 +1010,47 @@ class STCSanityChecker:
                 recommendations=["Verify Portworx is installed and running in the namespace"]
             ))
             return results
+
+        # Check pod health first
+        pod_health = stc_data.get('pod_health', {})
+        if pod_health:
+            not_ready = pod_health.get('not_ready', [])
+            total = pod_health.get('total', 0)
+            ready_count = len(pod_health.get('ready', []))
+            
+            if not_ready:
+                # Build details about unhealthy pods
+                unhealthy_details = {}
+                for pod_name in not_ready:
+                    details = pod_health.get('details', {}).get(pod_name, {})
+                    unhealthy_details[pod_name] = {
+                        'phase': details.get('phase', 'Unknown'),
+                        'container_state': details.get('portworx_container_state', 'Unknown')
+                    }
+                
+                # Determine severity based on how many pods are unhealthy
+                if ready_count == 0:
+                    level = ValidationLevel.CRITICAL
+                    message = f"All {total} Portworx pod(s) are unhealthy - migration cannot proceed"
+                elif len(not_ready) > total / 2:
+                    level = ValidationLevel.ERROR
+                    message = f"Majority of Portworx pods unhealthy: {len(not_ready)} of {total} pods not ready"
+                else:
+                    level = ValidationLevel.WARNING
+                    message = f"Some Portworx pods unhealthy: {len(not_ready)} of {total} pods not ready"
+                
+                results.append(ValidationResult(
+                    level=level,
+                    category="Pod Health",
+                    message=message,
+                    details={"unhealthy_pods": unhealthy_details, "ready_count": ready_count, "total": total},
+                    recommendations=[
+                        "Ensure all Portworx pods are healthy before migration",
+                        "Check pod logs: kubectl logs -n <namespace> <pod-name> -c portworx",
+                        "Describe unhealthy pods: kubectl describe pod -n <namespace> <pod-name>",
+                        "Verify storage nodes are healthy and accessible"
+                    ]
+                ))
 
         # For pxctl-based data, check the structure
         status = stc_data.get('status', {})
@@ -1603,6 +2114,77 @@ class CloudStorageValidator:
         return summary
 
 
+def detect_small_conf(stc_spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Detect small_conf (TNA - Two-Node with Arbiter) configuration from StorageCluster spec
+    
+    small_conf=1 is typically set in the portworx.io/misc-args annotation:
+      -rt_opts small_conf=1
+    
+    It indicates TNA mode where arbiter nodes have lower resource requirements:
+      - Arbiter node: 4 CPU cores, 4 GB RAM
+      - Storage nodes: still require standard 8 CPU / 8 GB RAM minimum
+    
+    Returns:
+        Dict with detection results:
+        {
+            'detected': bool,
+            'location': str (where it was found),
+            'misc_args': str (full misc-args value if present),
+            'is_tna_mode': bool
+        }
+    """
+    result = {
+        'detected': False,
+        'location': None,
+        'misc_args': None,
+        'is_tna_mode': False
+    }
+    
+    if not stc_spec:
+        return result
+    
+    # Check cluster-level annotation: metadata.annotations['portworx.io/misc-args']
+    metadata = stc_spec.get('metadata', {})
+    annotations = metadata.get('annotations', {})
+    misc_args = annotations.get('portworx.io/misc-args', '')
+    
+    if misc_args:
+        result['misc_args'] = misc_args
+        if 'small_conf=1' in misc_args or 'small_conf = 1' in misc_args:
+            result['detected'] = True
+            result['location'] = 'metadata.annotations[portworx.io/misc-args]'
+            result['is_tna_mode'] = True
+    
+    # Check spec.runtimeOptions for small_conf
+    spec = stc_spec.get('spec', {})
+    runtime_options = spec.get('runtimeOptions', {})
+    if runtime_options and isinstance(runtime_options, dict):
+        if runtime_options.get('small_conf') == '1' or runtime_options.get('small_conf') == 1:
+            result['detected'] = True
+            result['location'] = 'spec.runtimeOptions'
+            result['is_tna_mode'] = True
+    
+    # Check node-level overrides: spec.nodes[].runtimeOptions
+    nodes_spec = spec.get('nodes', [])
+    if nodes_spec and isinstance(nodes_spec, list):
+        for i, node_spec in enumerate(nodes_spec):
+            node_rt_opts = node_spec.get('runtimeOptions', {})
+            if node_rt_opts and isinstance(node_rt_opts, dict):
+                if node_rt_opts.get('small_conf') == '1' or node_rt_opts.get('small_conf') == 1:
+                    result['detected'] = True
+                    result['location'] = f'spec.nodes[{i}].runtimeOptions'
+                    result['is_tna_mode'] = True
+            
+            # Also check miscArgs at node level
+            node_misc_args = node_spec.get('miscArgs', '')
+            if node_misc_args and ('small_conf=1' in node_misc_args or 'small_conf = 1' in node_misc_args):
+                result['detected'] = True
+                result['location'] = f'spec.nodes[{i}].miscArgs'
+                result['is_tna_mode'] = True
+    
+    return result
+
+
 class MigrationReadinessReporter:
     """Generates comprehensive migration readiness reports"""
 
@@ -1816,7 +2398,7 @@ def main():
     """Main execution function"""
     # Debug: Script version identifier
     print("=" * 60)
-    print("PORTWORX MIGRATION VALIDATOR v1.0 (2026-04-02)")
+    print("PORTWORX MIGRATION VALIDATOR v2.0 (2026-04-02)")
     print("DEBUG: Running latest script with per-node migration mapping")
     print("=" * 60)
 
@@ -1892,6 +2474,12 @@ def main():
         cloud_storage_info = cloud_storage_validator.extract_cloud_storage_info(stc_spec)
         all_results.extend(cloud_storage_validator.validate_drive_types(cloud_storage_info))
 
+        # Detect small_conf (TNA - Two-Node with Arbiter) mode
+        logger.info("Checking for small_conf (TNA) configuration...")
+        small_conf_info = detect_small_conf(stc_spec)
+        if small_conf_info.get('detected'):
+            logger.info(f"small_conf detected at: {small_conf_info.get('location')}")
+
         # Drive type analysis is disabled - set empty values
         drive_conversion_plan = {}
         detected_drive_types = {}
@@ -1945,6 +2533,22 @@ def main():
             print(f"  Total Storage Nodes:        {len(nodes)}")
             print(f"  Total Storageless Nodes:    {(len(k8s_node_labels) - len(nodes)) if k8s_node_labels else 'N/A'}")
             print(f"  Total Storage Pools:        {len(pools)}")
+
+            # Pod health summary
+            pod_health = stc_data.get('pod_health', {})
+            if pod_health:
+                print(f"\nPOD HEALTH SUMMARY:")
+                print(f"  Total Portworx Pods:        {pod_health.get('total', 'N/A')}")
+                print(f"  Ready Pods:                 {len(pod_health.get('ready', []))}")
+                print(f"  Not Ready Pods:             {len(pod_health.get('not_ready', []))}")
+                
+                if pod_health.get('not_ready'):
+                    print(f"\n  ⚠️  UNHEALTHY PODS:")
+                    for pod_name in pod_health['not_ready']:
+                        details = pod_health.get('details', {}).get(pod_name, {})
+                        print(f"    - {pod_name}")
+                        print(f"      Phase: {details.get('phase', 'Unknown')}")
+                        print(f"      Container: {details.get('portworx_container_state', 'Unknown')}")
 
             # Sizing calculations
             if sizing_recommendations and 'cluster' in sizing_recommendations:
@@ -2101,6 +2705,106 @@ def main():
                     print(f"\n  📋 ACTION REQUIRED: Document and reapply these annotations post-migration")
                 else:
                     print(f"\n✅ No custom annotations detected")
+
+        # Print license validation
+        license_info = stc_data.get('license', {})
+        if license_info.get('type'):
+            print(f"\n{'='*60}")
+            print(f"LICENSE VALIDATION")
+            print(f"{'='*60}")
+            
+            license_type = license_info.get('type', 'Unknown')
+            is_trial = license_info.get('is_trial', False)
+            
+            print(f"\nLicense: {license_type}")
+            
+            if is_trial:
+                print(f"\n🚫 LICENSE CHECK: FAILED")
+                print(f"   CRITICAL: Trial license detected - Migration BLOCKED")
+                print(f"   StoreV2 migration requires a valid licensed Portworx installation")
+                print(f"\n   Volume Attachment Limits:")
+                print(f"     Trial:    {config.trial_volume_attachments_per_node} attachments per node")
+                print(f"     Licensed: {config.licensed_volume_attachments_per_node} attachments per node")
+                print(f"\n   ✏️  CORRECTIVE ACTION:")
+                print(f"   Contact Pure Storage/Portworx support to obtain a valid license")
+                print(f"   Apply license using: pxctl license activate <license-key>")
+            else:
+                print(f"\n✅ LICENSE CHECK: PASSED")
+                print(f"   Valid license detected - Migration allowed")
+                print(f"   Volume attachment limit: {config.licensed_volume_attachments_per_node} per node")
+
+        # Print volume attachments per node
+        volume_attachments = stc_data.get('volume_attachments', {})
+        license_info = stc_data.get('license', {})
+        is_trial = license_info.get('is_trial', False)
+        
+        if volume_attachments:
+            print(f"\n{'='*60}")
+            print(f"VOLUME ATTACHMENTS PER NODE")
+            print(f"{'='*60}")
+            
+            # Determine attachment limit based on license
+            if is_trial:
+                attachment_limit = config.trial_volume_attachments_per_node
+                print(f"\nLicense Type: Trial")
+            else:
+                attachment_limit = config.licensed_volume_attachments_per_node
+                print(f"\nLicense Type: Licensed")
+            
+            print(f"Attachment Limit per Node: {attachment_limit}")
+            
+            nodes_over_limit = []
+            nodes_near_limit = []
+            nodes_ok = []
+            
+            print(f"\n{'Node':<40} {'Attached':<10} {'Limit':<8} {'Usage':<8} {'Status'}")
+            print(f"{'-'*40} {'-'*10} {'-'*8} {'-'*8} {'-'*15}")
+            
+            for node_name, attach_info in volume_attachments.items():
+                attached = attach_info.get('attached', 0)
+                usage_pct = (attached / attachment_limit) * 100 if attachment_limit > 0 else 0
+                
+                # Truncate node name for display
+                display_name = node_name[:38] + '..' if len(node_name) > 40 else node_name
+                
+                if attached >= attachment_limit:
+                    status = "🚫 AT LIMIT"
+                    nodes_over_limit.append({'name': node_name, 'attached': attached})
+                elif usage_pct >= 80:
+                    status = "⚠️  HIGH"
+                    nodes_near_limit.append({'name': node_name, 'attached': attached})
+                else:
+                    status = "✅ OK"
+                    nodes_ok.append(node_name)
+                
+                print(f"{display_name:<40} {attached:<10} {attachment_limit:<8} {usage_pct:.0f}%{'':<5} {status}")
+            
+            # Summary
+            print(f"\n📊 Attachment Summary:")
+            
+            if nodes_over_limit:
+                print(f"\n🚫 NODES AT/OVER ATTACHMENT LIMIT ({len(nodes_over_limit)}):")
+                print(f"   WARNING: These nodes have reached maximum attachments")
+                for node in nodes_over_limit[:5]:
+                    print(f"   - {node['name']}: {node['attached']} attachments")
+                if len(nodes_over_limit) > 5:
+                    print(f"   ... and {len(nodes_over_limit) - 5} more")
+            
+            if nodes_near_limit:
+                print(f"\n⚠️  NODES NEAR ATTACHMENT LIMIT ({len(nodes_near_limit)}):")
+                print(f"   These nodes are at 80%+ of attachment limit")
+                for node in nodes_near_limit[:5]:
+                    print(f"   - {node['name']}: {node['attached']} attachments")
+                if len(nodes_near_limit) > 5:
+                    print(f"   ... and {len(nodes_near_limit) - 5} more")
+            
+            if not nodes_over_limit and not nodes_near_limit:
+                print(f"   ✅ All {len(nodes_ok)} node(s) have sufficient attachment capacity")
+            else:
+                print(f"\n   Summary:")
+                print(f"   Nodes OK:           {len(nodes_ok)}")
+                print(f"   Nodes near limit:   {len(nodes_near_limit)}")
+                print(f"   Nodes at limit:     {len(nodes_over_limit)}")
 
         # Print cloud storage drive type validation
         if cloud_storage_info and cloud_storage_info.get('provider'):
@@ -2299,6 +3003,224 @@ def main():
                 print(f"   Near-Full:  {len(near_full_pools)}")
                 print(f"   Full:       {len(full_pools)}")
                 print(f"   Offline:    {len(offline_pools)}")
+
+        # Print disk capacity per node analysis
+        node_drive_info = stc_data.get('node_drive_info', {})
+        if node_drive_info:
+            print(f"\n{'='*60}")
+            print(f"NODE DISK CAPACITY ANALYSIS")
+            print(f"{'='*60}")
+            
+            # Get provider from cloud storage info for max drives lookup
+            provider = ''
+            if cloud_storage_info:
+                provider = cloud_storage_info.get('provider', '').lower()
+            
+            max_drives = config.max_drives_per_node.get(provider, config.default_max_drives_per_node)
+            max_drives_per_pool = config.max_drives_per_pool
+            
+            print(f"\nPlatform: {provider.upper() if provider else 'Unknown (using default)'}")
+            print(f"Max Drives per Node: {max_drives}")
+            print(f"Max Drives per Pool: {max_drives_per_pool}")
+            
+            nodes_at_capacity = []
+            nodes_near_capacity = []
+            nodes_with_capacity = []
+            
+            print(f"\n{'Node':<40} {'Current':<10} {'Max':<8} {'Available':<10} {'Status'}")
+            print(f"{'-'*40} {'-'*10} {'-'*8} {'-'*10} {'-'*15}")
+            
+            for node_name, drive_info in node_drive_info.items():
+                if drive_info.get('error'):
+                    print(f"{node_name[:40]:<40} {'Error':<10} {max_drives:<8} {'N/A':<10} ⚠️  Query failed")
+                    continue
+                    
+                current_drives = drive_info.get('total_drives', 0)
+                available_slots = max_drives - current_drives
+                
+                # Truncate node name for display
+                display_name = node_name[:38] + '..' if len(node_name) > 40 else node_name
+                
+                if available_slots <= 0:
+                    status = "🚫 AT CAPACITY"
+                    nodes_at_capacity.append(node_name)
+                elif available_slots <= 2:
+                    status = "⚠️  LOW"
+                    nodes_near_capacity.append(node_name)
+                else:
+                    status = "✅ OK"
+                    nodes_with_capacity.append(node_name)
+                
+                print(f"{display_name:<40} {current_drives:<10} {max_drives:<8} {available_slots:<10} {status}")
+            
+            # Summary
+            print(f"\n📊 Disk Slot Summary:")
+            if nodes_at_capacity:
+                print(f"\n🚫 NODES AT DISK CAPACITY ({len(nodes_at_capacity)}):")
+                print(f"   WARNING: These nodes cannot attach additional drives")
+                for node in nodes_at_capacity[:5]:
+                    print(f"   - {node}")
+                if len(nodes_at_capacity) > 5:
+                    print(f"   ... and {len(nodes_at_capacity) - 5} more")
+                print(f"\n   ✏️  CORRECTIVE ACTION:")
+                print(f"   For StoreV2 migration, ensure nodes have available disk slots")
+                print(f"   Consider removing unused drives or expanding to new nodes")
+            
+            if nodes_near_capacity:
+                print(f"\n⚠️  NODES NEAR DISK CAPACITY ({len(nodes_near_capacity)}):")
+                print(f"   These nodes have limited disk slots remaining")
+                for node in nodes_near_capacity[:5]:
+                    print(f"   - {node}")
+                if len(nodes_near_capacity) > 5:
+                    print(f"   ... and {len(nodes_near_capacity) - 5} more")
+            
+            if not nodes_at_capacity and not nodes_near_capacity:
+                print(f"   ✅ All {len(nodes_with_capacity)} node(s) have sufficient disk slots available")
+            else:
+                print(f"\n   Summary:")
+                print(f"   Nodes with capacity:     {len(nodes_with_capacity)}")
+                print(f"   Nodes near capacity:     {len(nodes_near_capacity)}")
+                print(f"   Nodes at capacity:       {len(nodes_at_capacity)}")
+
+        # Print node CPU and memory resource analysis
+        node_resources = stc_data.get('node_resources', {})
+        if node_resources:
+            print(f"\n{'='*60}")
+            print(f"NODE CPU & MEMORY RESOURCE ANALYSIS")
+            print(f"{'='*60}")
+            
+            # Check for small_conf (TNA mode)
+            is_tna_mode = small_conf_info.get('detected', False)
+            
+            min_cpu = config.storev2_min_cpu_cores
+            min_mem = config.storev2_min_memory_gb
+            rec_cpu = config.storev2_recommended_cpu_cores
+            rec_mem = config.storev2_recommended_memory_gb
+            
+            # TNA/small_conf mode values
+            tna_min_cpu = config.small_conf_min_cpu_cores
+            tna_min_mem = config.small_conf_min_memory_gb
+            
+            print(f"\nStoreV2 Requirements:")
+            print(f"  Minimum:     {min_cpu} CPU cores, {min_mem:.0f} GB RAM")
+            print(f"  Recommended: {rec_cpu} CPU cores, {rec_mem:.0f} GB RAM")
+            
+            # Show TNA/small_conf status
+            if is_tna_mode:
+                print(f"\n📋 TNA MODE DETECTED (small_conf=1)")
+                print(f"   Location: {small_conf_info.get('location', 'Unknown')}")
+                print(f"   Arbiter node minimum: {tna_min_cpu} CPU cores, {tna_min_mem:.0f} GB RAM")
+                print(f"   Storage nodes: Standard requirements apply ({min_cpu} CPU, {min_mem:.0f} GB)")
+                if small_conf_info.get('misc_args'):
+                    print(f"   misc-args: {small_conf_info.get('misc_args')[:60]}{'...' if len(small_conf_info.get('misc_args', '')) > 60 else ''}")
+            else:
+                print(f"\n📋 Standard Mode (small_conf not detected)")
+            
+            nodes_below_min = []
+            nodes_below_recommended = []
+            nodes_meets_recommended = []
+            
+            # In TNA mode, we'll note nodes that meet TNA requirements but not standard
+            nodes_meets_tna_only = []
+            
+            print(f"\n{'Node':<35} {'CPU':<8} {'Memory (GB)':<12} {'Status'}")
+            print(f"{'-'*35} {'-'*8} {'-'*12} {'-'*20}")
+            
+            for node_name, resources in node_resources.items():
+                capacity = resources.get('capacity', {})
+                cpu = capacity.get('cpu', 0)
+                mem_gb = capacity.get('memory_gb', 0)
+                
+                # Truncate node name for display
+                display_name = node_name[:33] + '..' if len(node_name) > 35 else node_name
+                
+                # Check against standard requirements
+                meets_standard_min = cpu >= min_cpu and mem_gb >= min_mem
+                meets_recommended = cpu >= rec_cpu and mem_gb >= rec_mem
+                
+                # Check against TNA requirements (for arbiter nodes)
+                meets_tna_min = cpu >= tna_min_cpu and mem_gb >= tna_min_mem
+                
+                if meets_recommended:
+                    status = "✅ OK"
+                    nodes_meets_recommended.append(node_name)
+                elif meets_standard_min:
+                    status = "⚠️  BELOW RECOMMENDED"
+                    nodes_below_recommended.append({
+                        'name': node_name,
+                        'cpu': cpu,
+                        'memory_gb': mem_gb
+                    })
+                elif is_tna_mode and meets_tna_min:
+                    # In TNA mode, nodes meeting TNA min but not standard get a different status
+                    status = "⚠️  TNA ARBITER OK"
+                    nodes_meets_tna_only.append({
+                        'name': node_name,
+                        'cpu': cpu,
+                        'memory_gb': mem_gb
+                    })
+                else:
+                    status = "🚫 BELOW MINIMUM"
+                    nodes_below_min.append({
+                        'name': node_name,
+                        'cpu': cpu,
+                        'memory_gb': mem_gb
+                    })
+                
+                print(f"{display_name:<35} {cpu:<8.0f} {mem_gb:<12.1f} {status}")
+            
+            # Summary
+            print(f"\n📊 Resource Summary:")
+            
+            if is_tna_mode and nodes_meets_tna_only:
+                print(f"\nℹ️  TNA MODE NODES ({len(nodes_meets_tna_only)}):")
+                print(f"   These nodes meet TNA/arbiter requirements ({tna_min_cpu} CPU, {tna_min_mem:.0f} GB)")
+                print(f"   but not standard storage node requirements ({min_cpu} CPU, {min_mem:.0f} GB)")
+                for node in nodes_meets_tna_only[:5]:
+                    print(f"   - {node['name']}: CPU: {node['cpu']:.0f}, Memory: {node['memory_gb']:.1f} GB")
+                if len(nodes_meets_tna_only) > 5:
+                    print(f"   ... and {len(nodes_meets_tna_only) - 5} more")
+            
+            if nodes_below_min:
+                print(f"\n🚫 NODES BELOW MINIMUM REQUIREMENTS ({len(nodes_below_min)}):")
+                effective_min_cpu = tna_min_cpu if is_tna_mode else min_cpu
+                effective_min_mem = tna_min_mem if is_tna_mode else min_mem
+                print(f"   CRITICAL: These nodes do not meet {'TNA arbiter' if is_tna_mode else 'StoreV2'} minimum requirements")
+                for node in nodes_below_min[:5]:
+                    issues = []
+                    if node['cpu'] < effective_min_cpu:
+                        issues.append(f"CPU: {node['cpu']:.0f} < {effective_min_cpu}")
+                    if node['memory_gb'] < effective_min_mem:
+                        issues.append(f"Memory: {node['memory_gb']:.1f} GB < {effective_min_mem:.0f} GB")
+                    print(f"   - {node['name']}: {', '.join(issues)}")
+                if len(nodes_below_min) > 5:
+                    print(f"   ... and {len(nodes_below_min) - 5} more")
+                print(f"\n   ✏️  CORRECTIVE ACTION:")
+                print(f"   Upgrade nodes to meet minimum: {effective_min_cpu} CPU cores, {effective_min_mem:.0f} GB RAM")
+                print(f"   Or migrate workloads to nodes with sufficient resources")
+            
+            if nodes_below_recommended:
+                print(f"\n⚠️  NODES BELOW RECOMMENDED RESOURCES ({len(nodes_below_recommended)}):")
+                print(f"   These nodes meet minimum but not recommended requirements")
+                for node in nodes_below_recommended[:5]:
+                    issues = []
+                    if node['cpu'] < rec_cpu:
+                        issues.append(f"CPU: {node['cpu']:.0f} < {rec_cpu}")
+                    if node['memory_gb'] < rec_mem:
+                        issues.append(f"Memory: {node['memory_gb']:.1f} GB < {rec_mem:.0f} GB")
+                    print(f"   - {node['name']}: {', '.join(issues)}")
+                if len(nodes_below_recommended) > 5:
+                    print(f"   ... and {len(nodes_below_recommended) - 5} more")
+            
+            if not nodes_below_min and not nodes_below_recommended and not nodes_meets_tna_only:
+                print(f"   ✅ All {len(nodes_meets_recommended)} node(s) meet recommended resource requirements")
+            else:
+                print(f"\n   Summary:")
+                print(f"   Meets recommended:     {len(nodes_meets_recommended)}")
+                print(f"   Below recommended:     {len(nodes_below_recommended)}")
+                if is_tna_mode:
+                    print(f"   TNA arbiter only:      {len(nodes_meets_tna_only)}")
+                print(f"   Below minimum:         {len(nodes_below_min)}")
 
         # Print pool priority analysis
         if pool_settings_inventory.get('pools'):
@@ -2557,6 +3479,53 @@ def main():
         checks_warning = []
         checks_skipped = []
 
+        # 0. License Check (critical - must be first)
+        license_info = stc_data.get('license', {})
+        checks_performed.append("License (Not Trial)")
+        if license_info.get('is_trial'):
+            checks_failed.append("License (Trial - BLOCKED)")
+        elif license_info.get('type'):
+            checks_passed.append("License (Not Trial)")
+        else:
+            checks_skipped.append("License (Not detected)")
+
+        # 0b. Volume Attachments Check
+        volume_attachments = stc_data.get('volume_attachments', {})
+        checks_performed.append("Volume Attachments")
+        if volume_attachments:
+            is_trial = license_info.get('is_trial', False)
+            attachment_limit = config.trial_volume_attachments_per_node if is_trial else config.licensed_volume_attachments_per_node
+            
+            nodes_over_limit = 0
+            nodes_near_limit = 0
+            for node_name, attach_info in volume_attachments.items():
+                attached = attach_info.get('attached', 0)
+                usage_pct = (attached / attachment_limit) * 100 if attachment_limit > 0 else 0
+                
+                if attached >= attachment_limit:
+                    nodes_over_limit += 1
+                elif usage_pct >= 80:
+                    nodes_near_limit += 1
+            
+            if nodes_over_limit > 0:
+                checks_warning.append("Volume Attachments (At Limit)")
+            elif nodes_near_limit > 0:
+                checks_warning.append("Volume Attachments (Near Limit)")
+            else:
+                checks_passed.append("Volume Attachments")
+        else:
+            checks_skipped.append("Volume Attachments (No data)")
+
+        # 1. Pod Health Check
+        pod_health_issues = [r for r in all_results if r.category == 'Pod Health']
+        checks_performed.append("Pod Health (Containers Ready)")
+        if any(r.level in [ValidationLevel.CRITICAL, ValidationLevel.ERROR] for r in pod_health_issues):
+            checks_failed.append("Pod Health (Containers Ready)")
+        elif any(r.level == ValidationLevel.WARNING for r in pod_health_issues):
+            checks_warning.append("Pod Health (Containers Ready)")
+        else:
+            checks_passed.append("Pod Health (Containers Ready)")
+
         # 1. Cluster Capacity Check
         capacity_issues = [r for r in all_results if r.category in ['Capacity Risk', 'Capacity Validation', 'Capacity Planning']]
         capacity_critical = any(r.level in [ValidationLevel.CRITICAL, ValidationLevel.ERROR] for r in capacity_issues)
@@ -2645,6 +3614,89 @@ def main():
             checks_warning.append("Metadata Node Labels")
         else:
             checks_passed.append("Metadata Node Labels")
+
+        # 9. Node Disk Capacity (available disk slots)
+        node_drive_info = stc_data.get('node_drive_info', {})
+        checks_performed.append("Node Disk Capacity")
+        if node_drive_info:
+            # Get provider and max drives
+            provider = ''
+            if cloud_storage_info:
+                provider = cloud_storage_info.get('provider', '').lower()
+            max_drives = config.max_drives_per_node.get(provider, config.default_max_drives_per_node)
+            
+            # Check if any nodes are at or near capacity
+            nodes_at_capacity = 0
+            nodes_near_capacity = 0
+            for node_name, drive_info in node_drive_info.items():
+                if not drive_info.get('error'):
+                    current_drives = drive_info.get('total_drives', 0)
+                    available_slots = max_drives - current_drives
+                    if available_slots <= 0:
+                        nodes_at_capacity += 1
+                    elif available_slots <= 2:
+                        nodes_near_capacity += 1
+            
+            if nodes_at_capacity > 0:
+                checks_warning.append("Node Disk Capacity (At Limit)")
+            elif nodes_near_capacity > 0:
+                checks_warning.append("Node Disk Capacity (Near Limit)")
+            else:
+                checks_passed.append("Node Disk Capacity")
+        else:
+            checks_skipped.append("Node Disk Capacity (No data)")
+
+        # 10. Node CPU/Memory Resources (StoreV2 requirements)
+        node_resources = stc_data.get('node_resources', {})
+        checks_performed.append("Node Resources (CPU/Memory)")
+        if node_resources:
+            min_cpu = config.storev2_min_cpu_cores
+            min_mem = config.storev2_min_memory_gb
+            rec_cpu = config.storev2_recommended_cpu_cores
+            rec_mem = config.storev2_recommended_memory_gb
+            
+            # TNA mode uses lower requirements
+            tna_min_cpu = config.small_conf_min_cpu_cores
+            tna_min_mem = config.small_conf_min_memory_gb
+            is_tna = small_conf_info.get('detected', False)
+            
+            nodes_below_min = 0
+            nodes_below_recommended = 0
+            nodes_tna_only = 0
+            for node_name, resources in node_resources.items():
+                capacity = resources.get('capacity', {})
+                cpu = capacity.get('cpu', 0)
+                mem_gb = capacity.get('memory_gb', 0)
+                
+                meets_standard_min = cpu >= min_cpu and mem_gb >= min_mem
+                meets_tna_min = cpu >= tna_min_cpu and mem_gb >= tna_min_mem
+                
+                if cpu < min_cpu or mem_gb < min_mem:
+                    if is_tna and meets_tna_min:
+                        nodes_tna_only += 1
+                    else:
+                        nodes_below_min += 1
+                elif cpu < rec_cpu or mem_gb < rec_mem:
+                    nodes_below_recommended += 1
+            
+            if nodes_below_min > 0:
+                checks_failed.append("Node Resources (Below Minimum)")
+            elif nodes_below_recommended > 0:
+                checks_warning.append("Node Resources (Below Recommended)")
+            elif nodes_tna_only > 0:
+                checks_warning.append("Node Resources (TNA Arbiter Only)")
+            else:
+                checks_passed.append("Node Resources (CPU/Memory)")
+        else:
+            checks_skipped.append("Node Resources (No data)")
+
+        # 11. TNA (Two-Node with Arbiter) / small_conf Detection
+        checks_performed.append("TNA Mode (small_conf)")
+        if small_conf_info.get('detected', False):
+            # TNA mode is detected - this is informational, not a failure
+            checks_passed.append("TNA Mode (Detected)")
+        else:
+            checks_passed.append("TNA Mode (Standard Mode)")
 
         # Print summary table
         print(f"\n┌{'─'*68}┐")
@@ -2743,12 +3795,16 @@ def main():
         print(f"\n{'='*70}")
 
         # Exit with appropriate code
-        if by_level.get('CRITICAL') or by_level.get('ERROR'):
+        # Check both validation results (by_level) and summary checks (checks_failed)
+        has_critical_failures = by_level.get('CRITICAL') or by_level.get('ERROR') or checks_failed
+        has_warnings = by_level.get('WARNING') or checks_warning
+        
+        if has_critical_failures:
             print(f"│ {'FINAL VERDICT: ❌ MIGRATION BLOCKED':^66} │")
             print(f"│ {'Address critical issues before proceeding':^66} │")
             print(f"{'─'*70}")
             sys.exit(1)
-        elif by_level.get('WARNING'):
+        elif has_warnings:
             print(f"│ {'FINAL VERDICT: ⚠️  PROCEED WITH CAUTION':^66} │")
             print(f"│ {'Review warnings and take corrective actions':^66} │")
             print(f"{'─'*70}")

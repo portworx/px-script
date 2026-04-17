@@ -8,26 +8,31 @@ PORTWORX MIGRATION VALIDATION REPORT
 ================================================================================
 
 CLUSTER CAPACITY SUMMARY:
-  Total Capacity:  200.0 GB
-  Used Capacity:   16.0 GB (8.0%)
-  Free Capacity:   184.0 GB (92.0%)
+  Total Capacity:  205.0 GB
+  Used Capacity:   0.2 GB (0.1%)
+  Free Capacity:   204.8 GB (99.9%)
 
 NODE SUMMARY:
-  Total PX Nodes (all):       7
-  Total Storage Nodes:        4
-  Total Storageless Nodes:    3
+  Total PX Nodes (all):       5
+  Total Storage Nodes:        5
+  Total Storageless Nodes:    0
   Total Storage Pools:        1
 
+POD HEALTH SUMMARY:
+  Total Portworx Pods:        5
+  Ready Pods:                 5
+  Not Ready Pods:             0
+
 CAPACITY SIZING CALCULATION:
-  Total Used:          16.0 GB
-  Storage Nodes:       4
-  Min Per-Node:        4.0 GB
-  Recommended (+10.0%): 4.4 GB per node
+  Total Used:          0.2 GB
+  Storage Nodes:       5
+  Min Per-Node:        0.0 GB
+  Recommended (+10.0%): 0.0 GB per node
 
 PER-NODE CAPACITY RECOMMENDATION:
-  Recommended per node: 4.4 GB
-  Available per node:   50.0 GB
-  Status: ✅ SUFFICIENT (surplus: 45.6 GB per node)
+  Recommended per node: 0.0 GB
+  Available per node:   41.0 GB
+  Status: ✅ SUFFICIENT (surplus: 41.0 GB per node)
 
 ============================================================
 CUSTOM LABELS & METADATA ANALYSIS
@@ -57,14 +62,34 @@ CUSTOM LABELS & METADATA ANALYSIS
 ⚠️  CUSTOM POOL LABELS REQUIRING MIGRATION:
    These labels must be manually applied to new storage pools post-migration:
 
-  Node: local-px-int-wxq67
+  Node: local-px-int-v9m76
     Pool: pool-0
+      px/metadata-node=false
       iopriority=HIGH
+      px/enabled=true
 
   📋 ACTION REQUIRED: Reapply these labels after migration
 
 POOL LABEL CONSISTENCY CHECK:
   ✅ All pool labels are consistent across pools
+
+============================================================
+LICENSE VALIDATION
+============================================================
+
+License: Trial (expires in 30 days)
+
+🚫 LICENSE CHECK: FAILED
+   CRITICAL: Trial license detected - Migration BLOCKED
+   StoreV2 migration requires a valid licensed Portworx installation
+
+   Volume Attachment Limits:
+     Trial:    100 attachments per node
+     Licensed: 1024 attachments per node
+
+   ✏️  CORRECTIVE ACTION:
+   Contact Pure Storage/Portworx support to obtain a valid license
+   Apply license using: pxctl license activate <license-key>
 
 ============================================================
 CLOUD STORAGE DRIVE TYPE VALIDATION
@@ -83,26 +108,17 @@ Supported Drive Types for VSPHERE: eagerzeroedthick, lazyzeroedthick, thin
 CLUSTER SIZE & METADATA NODE VALIDATION
 ============================================================
 
-Total Storage Nodes: 4
+Total Storage Nodes: 5
 
-✅ CLUSTER SIZE CHECK: PASSED (4 nodes)
+✅ CLUSTER SIZE CHECK: PASSED (5 nodes)
 
 Metadata Node Label Distribution (px/metadata-node):
-  Total Portworx nodes:  7
-  Nodes with 'true':     0
-  Nodes with 'false':    4
-  Nodes without label:   3
+  Total Portworx nodes:  5
+  Nodes with 'true':     4
+  Nodes with 'false':    1
+  Nodes without label:   0
 
-🚫 METADATA NODE LABELS: FAILED
-   CRITICAL: 4 of 7 Portworx nodes have px/metadata-node=false
-   Only 3 nodes are metadata nodes, which is not safe for migration
-
-   ✏️  CORRECTIVE ACTION:
-   Remove the false labels from non-metadata nodes:
-     kubectl label node ip-10-38-102-47.pwx.purestorage.com px/metadata-node-
-     kubectl label node ip-10-38-102-62.pwx.purestorage.com px/metadata-node-
-     kubectl label node ip-10-38-102-65.pwx.purestorage.com px/metadata-node-
-     kubectl label node ip-10-38-102-67.pwx.purestorage.com px/metadata-node-
+✅ METADATA NODE LABELS: PASSED
 
 ============================================================
 POOL HEALTH & CAPACITY STATUS
@@ -111,10 +127,68 @@ POOL HEALTH & CAPACITY STATUS
 ✅ All 1 pool(s) are healthy and have sufficient capacity
 
 ============================================================
+NODE DISK CAPACITY ANALYSIS
+============================================================
+
+Platform: VSPHERE
+Max Drives per Node: 12
+Max Drives per Pool: 6
+
+Node                                     Current    Max      Available  Status
+---------------------------------------- ---------- -------- ---------- ---------------
+local-px-int-66hx2                       3          12       9          ✅ OK
+local-px-int-f7lcq                       3          12       9          ✅ OK
+local-px-int-jdbk9                       3          12       9          ✅ OK
+local-px-int-v5mlg                       3          12       9          ✅ OK
+local-px-int-v9m76                       3          12       9          ✅ OK
+
+📊 Disk Slot Summary:
+   ✅ All 5 node(s) have sufficient disk slots available
+
+============================================================
+NODE CPU & MEMORY RESOURCE ANALYSIS
+============================================================
+
+StoreV2 Requirements:
+  Minimum:     8 CPU cores, 8 GB RAM
+  Recommended: 16 CPU cores, 16 GB RAM
+
+📋 Standard Mode (small_conf not detected)
+
+Node                                CPU      Memory (GB)  Status
+----------------------------------- -------- ------------ --------------------
+ip-10-38-33-13.pwx.purestorage.com  8        7.7          🚫 BELOW MINIMUM
+ip-10-38-33-90.pwx.purestorage.com  8        7.7          🚫 BELOW MINIMUM
+ip-10-38-34-153.pwx.purestorage.com 8        7.7          🚫 BELOW MINIMUM
+ip-10-38-35-43.pwx.purestorage.com  8        7.7          🚫 BELOW MINIMUM
+ip-10-38-37-20.pwx.purestorage.com  8        7.7          🚫 BELOW MINIMUM
+
+📊 Resource Summary:
+
+🚫 NODES BELOW MINIMUM REQUIREMENTS (5):
+   CRITICAL: These nodes do not meet StoreV2 minimum requirements
+   - ip-10-38-33-13.pwx.purestorage.com: Memory: 7.7 GB < 8 GB
+   - ip-10-38-33-90.pwx.purestorage.com: Memory: 7.7 GB < 8 GB
+   - ip-10-38-34-153.pwx.purestorage.com: Memory: 7.7 GB < 8 GB
+   - ip-10-38-35-43.pwx.purestorage.com: Memory: 7.7 GB < 8 GB
+   - ip-10-38-37-20.pwx.purestorage.com: Memory: 7.7 GB < 8 GB
+
+   ✏️  CORRECTIVE ACTION:
+   Upgrade nodes to meet minimum: 8 CPU cores, 8 GB RAM
+   Or migrate workloads to nodes with sufficient resources
+
+   Summary:
+   Meets recommended:     0
+   Below recommended:     0
+   Below minimum:         5
+
+============================================================
 PRE-MIGRATION ACTION ITEMS
 ============================================================
-  1. Document and plan migration for 1 custom pool label(s)
+  1. Document and plan migration for 3 custom pool label(s)
+       - px/metadata-node
        - iopriority
+       - px/enabled
 
 ============================================================
 PER-NODE MIGRATION CAPACITY MAPPING
@@ -123,63 +197,65 @@ PER-NODE MIGRATION CAPACITY MAPPING
   Format: Node | Used | Required (+10.0% headroom) | Eligible Target Nodes
   ----------------------------------------------------------------------------
 
-  ip-10-38-102-64.pwx.purestorage.com
-    Used: 4.0 GB | Required: 4.4 GB | ✅ 3 node(s) available
-    Eligible targets: ip-10-38-102-62.pwx.purestorage.com, ip-10-38-102-63.pwx.purestorage.com, ip-10-38-102-65.pwx.purestorage.com
+  ip-10-38-33-90.pwx.purestorage.com
+    Used: 0.0 GB | Required: 0.0 GB | ✅ 4 node(s) available
+    Eligible targets: ip-10-38-37-20.pwx.purestorage.com, ip-10-38-33-13.pwx.purestorage.com, ip-10-38-34-153.pwx.purestorage.com (+1 more)
 
-  ip-10-38-102-62.pwx.purestorage.com
-    Used: 4.0 GB | Required: 4.4 GB | ✅ 3 node(s) available
-    Eligible targets: ip-10-38-102-64.pwx.purestorage.com, ip-10-38-102-63.pwx.purestorage.com, ip-10-38-102-65.pwx.purestorage.com
+  ip-10-38-37-20.pwx.purestorage.com
+    Used: 0.0 GB | Required: 0.0 GB | ✅ 4 node(s) available
+    Eligible targets: ip-10-38-33-90.pwx.purestorage.com, ip-10-38-33-13.pwx.purestorage.com, ip-10-38-34-153.pwx.purestorage.com (+1 more)
 
-  ip-10-38-102-63.pwx.purestorage.com
-    Used: 4.0 GB | Required: 4.4 GB | ✅ 3 node(s) available
-    Eligible targets: ip-10-38-102-64.pwx.purestorage.com, ip-10-38-102-62.pwx.purestorage.com, ip-10-38-102-65.pwx.purestorage.com
+  ip-10-38-33-13.pwx.purestorage.com
+    Used: 0.0 GB | Required: 0.0 GB | ✅ 4 node(s) available
+    Eligible targets: ip-10-38-33-90.pwx.purestorage.com, ip-10-38-37-20.pwx.purestorage.com, ip-10-38-34-153.pwx.purestorage.com (+1 more)
 
-  ip-10-38-102-65.pwx.purestorage.com
-    Used: 4.0 GB | Required: 4.4 GB | ✅ 3 node(s) available
-    Eligible targets: ip-10-38-102-64.pwx.purestorage.com, ip-10-38-102-62.pwx.purestorage.com, ip-10-38-102-63.pwx.purestorage.com
+  ip-10-38-34-153.pwx.purestorage.com
+    Used: 0.0 GB | Required: 0.0 GB | ✅ 4 node(s) available
+    Eligible targets: ip-10-38-33-90.pwx.purestorage.com, ip-10-38-37-20.pwx.purestorage.com, ip-10-38-33-13.pwx.purestorage.com (+1 more)
+
+  ip-10-38-35-43.pwx.purestorage.com
+    Used: 0.0 GB | Required: 0.0 GB | ✅ 4 node(s) available
+    Eligible targets: ip-10-38-33-90.pwx.purestorage.com, ip-10-38-37-20.pwx.purestorage.com, ip-10-38-33-13.pwx.purestorage.com (+1 more)
 
   ----------------------------------------------------------------------------
 
-  ✅ All 4 nodes have at least one eligible migration target
+  ✅ All 5 nodes have at least one eligible migration target
 
 ======================================================================
-                     MIGRATION READINESS SUMMARY
+                     MIGRATION READINESS SUMMARY                      
 ======================================================================
 
 ┌────────────────────────────────────────────────────────────────────┐
 │ CHECK                                    STATUS                    │
 ├────────────────────────────────────────────────────────────────────┤
+│ Pod Health (Containers Ready)            ✅ PASSED                  │
 │ Cluster Capacity                         ✅ PASSED                  │
 │ Pool Health (Offline/Full)               ✅ PASSED                  │
 │ Cloud Storage Drive Types                ✅ PASSED                  │
 │ Pool Configuration (Priorities)          ✅ PASSED                  │
 │ Data Integrity                           ✅ PASSED                  │
 │ Cluster Size (Min Nodes)                 ✅ PASSED                  │
+│ Metadata Node Labels                     ✅ PASSED                  │
+│ Node Disk Capacity                       ✅ PASSED                  │
+│ TNA Mode (Standard Mode)                 ✅ PASSED                  │
 │ Custom Labels/Metadata (Action Required) ⚠️  WARNING               │
-│ Metadata Node Labels                     ❌ FAILED                  │
+│ License (Trial - BLOCKED)                ❌ FAILED                  │
+│ Node Resources (Below Minimum)           ❌ FAILED                  │
+│ Volume Attachments (No data)             ⏭️  SKIPPED               │
 └────────────────────────────────────────────────────────────────────┘
 
 📊 QUICK STATS:
-   Total Checks: 8
-   ✅ Passed:    6
+   Total Checks: 14
+   ✅ Passed:    10
    ⚠️  Warnings:  1
-   ❌ Failed:    1
-   ⏭️  Skipped:   0
+   ❌ Failed:    2
+   ⏭️  Skipped:   1
 
 ======================================================================
-                            ACTION SUMMARY
+                            ACTION SUMMARY                            
 ======================================================================
 
-🚨 BLOCKERS - Must be resolved before migration:
-──────────────────────────────────────────────────────────────────────
-
-  1. [CRITICAL] Metadata Node Labels
-     Issue: Invalid px/metadata-node label configuration: 4 of 7 nodes have px/metadata-node=false
-     Actions:
-       → Migration cannot proceed with this label configuration
-       → Only 3 nodes are metadata nodes, which is not safe for migration
-       → Remove the px/metadata-node=false labels from non-metadata nodes
+✅ No blocking issues found
 
 ⚠️  WARNINGS - Review and address if needed:
 ──────────────────────────────────────────────────────────────────────
