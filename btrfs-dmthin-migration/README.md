@@ -8,6 +8,13 @@ This script connects to your Kubernetes cluster, executes `pxctl` commands on Po
 
 ## Features
 
+### 🩺 Pod Health Validation
+- **Pre-flight Container Readiness Check**: Validates all Portworx pod containers are ready before executing commands
+- Retrieves pod status via `kubectl get pods -o json` to check container ready states
+- **Prevents false failures**: Avoids cryptic "container not found" errors from unhealthy pods
+- **Clear health reporting**: Shows ready vs total pods with detailed status
+- **CRITICAL BLOCKER**: Migration cannot proceed if any Portworx pods have unready containers
+
 ### 📊 Portworx Data Retrieval and Analysis
 - Automatically discovers Portworx pods via `kubectl -n <namespace> get pods -l name=portworx`
 - Executes `pxctl status` to gather cluster-wide capacity and node information
@@ -42,6 +49,48 @@ This script connects to your Kubernetes cluster, executes `pxctl` commands on Po
 - **Near-Full Pool Warning**: Warns about pools at 95%+ capacity
 - Migration cannot proceed with offline or completely filled pools
 
+### � Node Disk Capacity Validation
+- **Per-node disk inventory**: Uses `pxctl service drive show` to count drives on each node
+- **Platform-aware limits**: Checks against maximum drives per node based on cloud provider:
+  - **AWS / Azure / GCP / IBM**: 8 drives per node
+  - **vSphere**: 12 drives per node  
+  - **Pure**: 32 drives per node
+- **Available slot calculation**: `Remaining slots = Platform max - Current drives`
+- **Pool drive limits**: Default 6 drives per pool (configurable via `limit_drives_per_pool`)
+- **Capacity status reporting**:
+  - ✅ OK: Sufficient disk slots available
+  - ⚠️ LOW: 2 or fewer slots remaining
+  - 🚫 AT CAPACITY: No available disk slots
+- **WARNING**: Nodes at disk capacity cannot attach additional drives for migration
+
+### 🖥️ Node CPU & Memory Resource Validation
+- **StoreV2 Resource Requirements**:
+  - **Minimum**: 8 CPU cores, 8 GB RAM per node
+  - **Recommended**: 16 CPU cores, 16 GB RAM per node
+- Retrieves node capacity and allocatable resources from Kubernetes API
+- **Resource status reporting**:
+  - ✅ OK: Meets recommended requirements
+  - ⚠️ BELOW RECOMMENDED: Meets minimum but not recommended
+  - 🚫 BELOW MINIMUM: Does not meet minimum requirements
+- **CRITICAL BLOCKER**: Nodes below minimum requirements will block migration
+- Provides corrective actions for upgrading node resources
+
+### � License Validation
+- **Trial License Blocking**: Parses `pxctl status` output to detect license type
+- **CRITICAL BLOCKER**: Trial licenses block StoreV2 migration
+- **Volume Attachment Limits**:
+  - **Licensed**: 1024 attachments per node
+  - **Trial**: 100 attachments per node
+- Provides corrective actions to obtain valid license
+
+### 📎 Volume Attachments Per Node
+- Retrieves actual volume attachment counts using `kubectl get volumeattachments.storage.k8s.io`
+- Compares current attachments against license limits (1024 licensed, 100 trial)
+- **Attachment Status Reporting**:
+  - ✅ OK: Below 80% of limit
+  - ⚠️ HIGH: At 80%+ of limit
+  - 🚫 AT LIMIT: At or over attachment limit
+- Helps identify nodes that may hit attachment limits during migration
 ### 🔢 Cluster Size Validation
 - **Minimum Node Requirement**: StoreV2 migration requires more than 3 nodes
 - Validates total Portworx node count (not just storage nodes)
@@ -154,6 +203,29 @@ class STCConfig:
         'gke': ['pd-ssd'],
         'vsphere': ['eagerzeroedthick', 'lazyzeroedthick', 'thin']
     }
+    
+    # Maximum drives per node by cloud provider
+    max_drives_per_node: Dict[str, int] = {
+        'aws': 8, 'azure': 8, 'gce': 8, 'gke': 8,
+        'google': 8, 'ibm': 8, 'vsphere': 12, 'pure': 32
+    }
+    
+    # Default max drives for unknown providers
+    default_max_drives_per_node: int = 8
+    
+    # Default max drives per pool
+    max_drives_per_pool: int = 6
+    
+    # StoreV2 node resource requirements
+    storev2_min_cpu_cores: int = 8
+    storev2_min_memory_gb: float = 8.0
+    storev2_recommended_cpu_cores: int = 16
+    storev2_recommended_memory_gb: float = 16.0
+    
+    # License requirements for StoreV2 migration
+    # Trial licenses are not allowed for migration
+    licensed_volume_attachments_per_node: int = 1024
+    trial_volume_attachments_per_node: int = 100
 ```
 
 ## Example Output
@@ -173,6 +245,12 @@ NODE SUMMARY:
   Total Storage Nodes: 4
   Total Storage Pools: 4
 
+POD HEALTH:
+  Total Portworx Pods: 4
+  Pods with All Containers Ready: 4/4
+
+✅ POD HEALTH: All Portworx pods are healthy
+
 ============================================================
 CLOUD STORAGE DRIVE TYPE VALIDATION
 ============================================================
@@ -186,6 +264,69 @@ CLOUD STORAGE DRIVE TYPE VALIDATION
 POOL HEALTH & CAPACITY STATUS
 ============================================================
 ✅ All pools are online and healthy
+
+============================================================
+NODE DISK CAPACITY ANALYSIS
+============================================================
+Platform: AZURE
+Max Drives per Node: 8
+Max Drives per Pool: 6
+
+Node                                     Current    Max      Available  Status
+---------------------------------------- ---------- -------- ---------- ---------------
+worker-node-1                            4          8        4          ✅ OK
+worker-node-2                            4          8        4          ✅ OK
+worker-node-3                            5          8        3          ✅ OK
+worker-node-4                            6          8        2          ⚠️  LOW
+
+📊 Disk Slot Summary:
+   ✅ All 4 node(s) have sufficient disk slots available
+
+============================================================
+NODE CPU & MEMORY RESOURCE ANALYSIS
+============================================================
+
+StoreV2 Requirements:
+  Minimum:     8 CPU cores, 8 GB RAM
+  Recommended: 16 CPU cores, 16 GB RAM
+
+
+Node                                CPU      Memory (GB)  Status
+----------------------------------- -------- ------------ --------------------
+worker-node-1                       16       64.0         ✅ OK
+worker-node-2                       16       64.0         ✅ OK
+worker-node-3                       8        32.0         ⚠️  BELOW RECOMMENDED
+worker-node-4                       16       64.0         ✅ OK
+
+📊 Resource Summary:
+   ✅ All 4 node(s) meet minimum resource requirements
+
+============================================================
+LICENSE VALIDATION
+============================================================
+
+License: PX-Enterprise
+
+✅ LICENSE CHECK: PASSED
+   Valid license detected - Migration allowed
+   Volume attachment limit: 1024 per node
+
+============================================================
+VOLUME ATTACHMENTS PER NODE
+============================================================
+
+License Type: Licensed
+Attachment Limit per Node: 1024
+
+Node                                     Attached   Limit    Usage    Status
+---------------------------------------- ---------- -------- -------- ---------------
+worker-node-1                            45         1024     4%       ✅ OK
+worker-node-2                            52         1024     5%       ✅ OK
+worker-node-3                            38         1024     4%       ✅ OK
+worker-node-4                            41         1024     4%       ✅ OK
+
+📊 Attachment Summary:
+   ✅ All 4 node(s) have sufficient attachment capacity
 
 ============================================================
 CLUSTER SIZE & METADATA NODE LABELS
@@ -205,8 +346,13 @@ Metadata Node Label Distribution (px/metadata-node):
 ============================================================
 FINAL VALIDATION SUMMARY
 ============================================================
+  License:                  PASSED
+  Volume Attachments:       PASSED
+  Pod Health:               PASSED
   Pool Health:              PASSED
   Cloud Storage:            PASSED
+  Node Disk Capacity:       PASSED
+  Node Resources:           PASSED
   Cluster Size:             PASSED
   Metadata Node Labels:     PASSED
 
@@ -216,6 +362,95 @@ FINAL VALIDATION SUMMARY
 
 ### Validation Failure Example
 ```
+POD HEALTH:
+  Total Portworx Pods: 5
+  Pods with All Containers Ready: 3/5
+
+🚫 POD HEALTH: FAILED
+   2 pods have unhealthy/unready containers
+   Unhealthy pods:
+     - px-cluster-abc123-node1 (containers ready: 0/1)
+     - px-cluster-abc123-node2 (containers ready: 0/1)
+
+   ✏️  CORRECTIVE ACTION:
+   Investigate and fix unhealthy pods before proceeding with migration:
+     kubectl -n portworx describe pod px-cluster-abc123-node1
+     kubectl -n portworx logs px-cluster-abc123-node1 -c portworx
+
+============================================================
+NODE DISK CAPACITY ANALYSIS
+============================================================
+Platform: AWS
+Max Drives per Node: 8
+Max Drives per Pool: 6
+
+Node                                     Current    Max      Available  Status
+---------------------------------------- ---------- -------- ---------- ---------------
+worker-node-1                            8          8        0          🚫 AT CAPACITY
+worker-node-2                            7          8        1          ⚠️  LOW
+worker-node-3                            4          8        4          ✅ OK
+
+📊 Disk Slot Summary:
+
+🚫 NODES AT DISK CAPACITY (1):
+   WARNING: These nodes cannot attach additional drives
+   - worker-node-1
+
+   ✏️  CORRECTIVE ACTION:
+   For StoreV2 migration, ensure nodes have available disk slots
+   Consider removing unused drives or expanding to new nodes
+
+⚠️  NODES NEAR DISK CAPACITY (1):
+   These nodes have limited disk slots remaining
+   - worker-node-2
+
+============================================================
+NODE CPU & MEMORY RESOURCE ANALYSIS
+============================================================
+
+StoreV2 Requirements:
+  Minimum:     8 CPU cores, 8 GB RAM
+  Recommended: 16 CPU cores, 16 GB RAM
+
+Node                                CPU      Memory (GB)  Status
+----------------------------------- -------- ------------ --------------------
+worker-node-1                       4        4.0          🚫 BELOW MINIMUM
+worker-node-2                       8        16.0         ⚠️  BELOW RECOMMENDED
+worker-node-3                       16       64.0         ✅ OK
+
+📊 Resource Summary:
+
+🚫 NODES BELOW MINIMUM REQUIREMENTS (1):
+   CRITICAL: These nodes do not meet StoreV2 minimum requirements
+   - worker-node-1: CPU: 4 < 8, Memory: 4.0 GB < 8 GB
+
+   ✏️  CORRECTIVE ACTION:
+   Upgrade nodes to meet minimum: 8 CPU cores, 8 GB RAM
+   Or migrate workloads to nodes with sufficient resources
+
+⚠️  NODES BELOW RECOMMENDED RESOURCES (1):
+   These nodes meet minimum but not recommended requirements
+   - worker-node-2: CPU: 8 < 16
+```
+
+============================================================
+LICENSE VALIDATION
+============================================================
+
+License: Trial (expires in 30 days)
+
+🚫 LICENSE CHECK: FAILED
+   CRITICAL: Trial license detected - Migration BLOCKED
+   StoreV2 migration requires a valid licensed Portworx installation
+
+   Volume Attachment Limits:
+     Trial:    100 attachments per node
+     Licensed: 1024 attachments per node
+
+   ✏️  CORRECTIVE ACTION:
+   Contact Pure Storage/Portworx support to obtain a valid license
+   Apply license using: pxctl license activate <license-key>
+
 ============================================================
 CLOUD STORAGE DRIVE TYPE VALIDATION
 ============================================================
@@ -255,6 +490,12 @@ Metadata Node Label Distribution (px/metadata-node):
 
 ## Validation Categories
 
+### Pod Health
+- Pre-flight validation of Portworx pod container readiness
+- Checks all containers in each pod are in Ready state
+- Prevents "container not found" errors during pxctl execution
+- CRITICAL blocker if any pods have unready containers
+
 ### Data Integrity
 - Missing required fields in cluster data
 - Unexpected zero values in capacity metrics
@@ -264,6 +505,31 @@ Metadata Node Label Distribution (px/metadata-node):
 - Offline/unhealthy pool detection (CRITICAL blocker)
 - Completely filled pools at 99%+ capacity (CRITICAL blocker)
 - Near-full pools at 95%+ capacity (ERROR)
+
+### Node Disk Capacity
+- Per-node drive inventory using `pxctl service drive show`
+- Platform-specific maximum drive limits (AWS/Azure/GCP: 8, vSphere: 12, Pure: 32)
+- Available disk slot calculation for each node
+- WARNING if nodes are at or near disk attachment limits
+- Ensures sufficient disk slots available for migration
+
+### Node Resources (CPU/Memory)
+- Per-node CPU and memory capacity from Kubernetes API
+- StoreV2 minimum requirements: 8 CPU cores, 8 GB RAM
+- StoreV2 recommended requirements: 16 CPU cores, 16 GB RAM
+- CRITICAL blocker if nodes are below minimum requirements
+- WARNING if nodes are below recommended requirements
+
+### License
+- Parses license type from `pxctl status` output
+- Trial licenses block StoreV2 migration (CRITICAL blocker)
+- Licensed installations are allowed to proceed
+
+### Volume Attachments
+- Retrieves per-node attachment counts from Kubernetes VolumeAttachment objects
+- Compares against license limits (1024 for licensed, 100 for trial)
+- WARNING if nodes are at 80%+ of attachment limit
+
 
 ### Cloud Storage
 - Drive type validation against supported types per provider
@@ -319,6 +585,103 @@ Metadata Node Label Distribution (px/metadata-node):
    kubectl auth can-i exec pods -n portworx
    kubectl -n portworx exec <pod-name> -- pxctl status
    ```
+
+4. **Pod health validation failures**
+   ```bash
+   # Check Portworx pod status
+   kubectl -n portworx get pods -l name=portworx
+   
+   # Describe unhealthy pod for details
+   kubectl -n portworx describe pod <pod-name>
+   
+   # Check Portworx container logs
+   kubectl -n portworx logs <pod-name> -c portworx
+   
+   # Common causes:
+   # - Portworx container not yet started
+   # - Storage initialization in progress
+   # - Node connectivity issues
+   ```
+
+5. **Nodes at disk capacity**
+   ```bash
+   # Check drives on a specific node
+   kubectl -n portworx exec <pod-name> -- pxctl service drive show
+   
+   # Check pool and drive mapping
+   kubectl -n portworx exec <pod-name> -- pxctl service pool show
+   
+   # List all block devices on node (OS level)
+   kubectl -n portworx exec <pod-name> -- lsblk -d -o NAME,SIZE,TYPE
+   
+   # Platform limits:
+   # - AWS/Azure/GCP/IBM: 8 drives per node
+   # - vSphere: 12 drives per node
+   # - Pure: 32 drives per node
+   
+   # Solutions:
+   # - Remove unused drives from the node
+   # - Add new nodes to the cluster
+   # - Redistribute workloads to nodes with available capacity
+   ```
+
+6. **Nodes below CPU/memory requirements**
+   ```bash
+   # Check node resources
+   kubectl get nodes -o custom-columns="NAME:.metadata.name,CPU:.status.capacity.cpu,MEMORY:.status.capacity.memory"
+   
+   # Check allocatable resources (after system reservations)
+   kubectl get nodes -o custom-columns="NAME:.metadata.name,CPU:.status.allocatable.cpu,MEMORY:.status.allocatable.memory"
+   
+   # StoreV2 Requirements:
+   # - Minimum: 8 CPU cores, 8 GB RAM
+   # - Recommended: 16 CPU cores, 16 GB RAM
+   
+   # Solutions:
+   # - Upgrade node instance type to meet requirements
+   # - Add new nodes with sufficient resources
+   # - Use larger VM sizes for worker nodes
+   # - For on-prem: Add physical CPU/memory to nodes
+   ```
+
+7. **Trial license detected**
+   ```bash
+   # Check current license
+   kubectl -n portworx exec <pod-name> -- pxctl status | grep License
+   
+   # Get detailed license info
+   kubectl -n portworx exec <pod-name> -- pxctl license list
+   
+   # Trial licenses have limited volume attachments (100 per node)
+   # StoreV2 migration requires a valid license
+   
+   # Solutions:
+   # - Contact Pure Storage/Portworx support for license
+   # - Apply license: pxctl license activate <license-key>
+   # - For evaluation: Request extended trial or enterprise license
+   ```
+
+8. **Volume attachments at limit**
+   ```bash
+   # Check volume attachments per node
+   kubectl get volumeattachments.storage.k8s.io -o json | \
+     jq -r '[.items[] | select(.status.attached==true)] | group_by(.spec.nodeName)[] | "\(.[0].spec.nodeName) \(length)"'
+   
+   # License limits:
+   # - Licensed: 1024 attachments per node
+   # - Trial: 100 attachments per node
+   
+   # Check which PVCs are attached to a node
+   kubectl get volumeattachments.storage.k8s.io -o json | \
+     jq -r '.items[] | select(.spec.nodeName=="<node-name>") | .spec.source.persistentVolumeName'
+   
+   # Solutions:
+   # - Scale down workloads to reduce attachments
+   # - Redistribute pods to other nodes
+   # - Upgrade license if on trial
+   # - Add more nodes to the cluster
+   ```
+
 
 ### Logs
 The script generates logs in `stc_validation.log` for debugging purposes.
