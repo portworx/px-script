@@ -91,22 +91,7 @@ This script connects to your Kubernetes cluster, executes `pxctl` commands on Po
   - ⚠️ HIGH: At 80%+ of limit
   - 🚫 AT LIMIT: At or over attachment limit
 - Helps identify nodes that may hit attachment limits during migration
-### 📋 TNA (Two-Node with Arbiter) / small_conf Detection
-- **Detects small_conf mode** for Two-Node with Arbiter (TNA) configurations
-- Parses StorageCluster spec for `small_conf=1` in multiple locations:
-  - `metadata.annotations['portworx.io/misc-args']`
-  - `spec.runtimeOptions.small_conf`
-  - `spec.nodes[].runtimeOptions.small_conf` (node-level override)
-  - `spec.nodes[].miscArgs` (node-level misc args)
-- **TNA Mode Resource Requirements**:
-  - **Arbiter nodes**: 4 CPU cores, 4 GB RAM (reduced requirements)
-  - **Storage nodes**: Standard requirements (8 CPU, 8 GB minimum)
-- **TNA Status Reporting**:
-  - Displays TNA mode detection and location
-  - Shows which nodes meet TNA arbiter requirements but not standard
-  - Adjusts resource validation based on TNA mode
-- **Use Cases**: Edge deployments, small clusters with dedicated arbiter nodes
-### �🔢 Cluster Size Validation
+### 🔢 Cluster Size Validation
 - **Minimum Node Requirement**: StoreV2 migration requires more than 3 nodes
 - Validates total Portworx node count (not just storage nodes)
 - **CRITICAL BLOCKER**: Clusters with 3 or fewer nodes cannot migrate
@@ -237,11 +222,6 @@ class STCConfig:
     storev2_recommended_cpu_cores: int = 16
     storev2_recommended_memory_gb: float = 16.0
     
-    # TNA (Two-Node with Arbiter) / small_conf resource requirements
-    # For arbiter nodes in TNA mode, lower resources are acceptable
-    small_conf_min_cpu_cores: int = 4
-    small_conf_min_memory_gb: float = 4.0
-    
     # License requirements for StoreV2 migration
     # Trial licenses are not allowed for migration
     licensed_volume_attachments_per_node: int = 1024
@@ -310,7 +290,6 @@ StoreV2 Requirements:
   Minimum:     8 CPU cores, 8 GB RAM
   Recommended: 16 CPU cores, 16 GB RAM
 
-📋 Standard Mode (small_conf not detected)
 
 Node                                CPU      Memory (GB)  Status
 ----------------------------------- -------- ------------ --------------------
@@ -454,43 +433,6 @@ worker-node-3                       16       64.0         ✅ OK
    - worker-node-2: CPU: 8 < 16
 ```
 
-### TNA Mode Example (with small_conf)
-```
-============================================================
-NODE CPU & MEMORY RESOURCE ANALYSIS
-============================================================
-
-StoreV2 Requirements:
-  Minimum:     8 CPU cores, 8 GB RAM
-  Recommended: 16 CPU cores, 16 GB RAM
-
-📋 TNA MODE DETECTED (small_conf=1)
-   Location: metadata.annotations['portworx.io/misc-args']
-   Arbiter node minimum: 4 CPU cores, 4 GB RAM
-   Storage nodes: Standard requirements apply (8 CPU, 8 GB)
-   misc-args: -rt_opts small_conf=1
-
-Node                                CPU      Memory (GB)  Status
------------------------------------ -------- ------------ --------------------
-worker-node-1                       16       64.0         ✅ OK
-worker-node-2                       16       64.0         ✅ OK
-arbiter-node                        4        4.0          ⚠️  TNA ARBITER OK
-
-📊 Resource Summary:
-
-ℹ️  TNA MODE NODES (1):
-   These nodes meet TNA/arbiter requirements (4 CPU, 4 GB)
-   but not standard storage node requirements (8 CPU, 8 GB)
-   - arbiter-node: CPU: 4, Memory: 4.0 GB
-
-   Summary:
-   Meets recommended:     2
-   Below recommended:     0
-   TNA arbiter only:      1
-   Below minimum:         0
-```
-
-```
 ============================================================
 LICENSE VALIDATION
 ============================================================
@@ -588,11 +530,6 @@ Metadata Node Label Distribution (px/metadata-node):
 - Compares against license limits (1024 for licensed, 100 for trial)
 - WARNING if nodes are at 80%+ of attachment limit
 
-### TNA Mode (small_conf)
-- Detects TNA (Two-Node with Arbiter) configurations via `small_conf=1`
-- Parses StorageCluster annotations, runtimeOptions, and node-level configurations
-- Adjusts resource requirements for arbiter nodes (4 CPU, 4 GB minimum)
-- Informational check - TNA mode is supported for migration
 
 ### Cloud Storage
 - Drive type validation against supported types per provider
@@ -745,29 +682,6 @@ Metadata Node Label Distribution (px/metadata-node):
    # - Add more nodes to the cluster
    ```
 
-9. **TNA / small_conf mode detection**
-   ```bash
-   # Check if small_conf is set in StorageCluster annotations
-   kubectl -n portworx get storagecluster -o jsonpath='{.items[0].metadata.annotations.portworx\.io/misc-args}' | grep small_conf
-   
-   # Check runtimeOptions in StorageCluster spec
-   kubectl -n portworx get storagecluster -o yaml | grep -A5 runtimeOptions
-   
-   # TNA Mode (Two-Node with Arbiter):
-   # - Uses small_conf=1 to reduce arbiter node requirements
-   # - Arbiter nodes need only 4 CPU cores, 4 GB RAM
-   # - Storage nodes still require full 8 CPU, 8 GB minimum
-   
-   # Common locations for small_conf:
-   # - metadata.annotations['portworx.io/misc-args']: "-rt_opts small_conf=1"
-   # - spec.runtimeOptions.small_conf: "1"
-   # - spec.nodes[].runtimeOptions.small_conf (node-level)
-   
-   # Example StorageCluster with TNA:
-   # metadata:
-   #   annotations:
-   #     portworx.io/misc-args: "-rt_opts small_conf=1"
-   ```
 
 ### Logs
 The script generates logs in `stc_validation.log` for debugging purposes.

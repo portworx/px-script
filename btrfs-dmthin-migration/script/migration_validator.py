@@ -107,13 +107,6 @@ class STCConfig:
     storev2_recommended_cpu_cores: int = 16
     storev2_recommended_memory_gb: float = 16.0
     
-    # Small config (TNA - Two-Node with Arbiter) resource requirements
-    # When small_conf=1 is present in misc-args, arbiter node has lower requirements
-    # Arbiter node: 4 CPU cores, 4 GB RAM
-    # Storage nodes still require standard minimums (8 CPU, 8 GB)
-    small_conf_min_cpu_cores: int = 4
-    small_conf_min_memory_gb: float = 4.0
-    
     # License requirements for StoreV2 migration
     # Trial licenses are not allowed for migration
     # Volume attachment limits per node:
@@ -2114,77 +2107,6 @@ class CloudStorageValidator:
         return summary
 
 
-def detect_small_conf(stc_spec: Dict[str, Any]) -> Dict[str, Any]:
-    """Detect small_conf (TNA - Two-Node with Arbiter) configuration from StorageCluster spec
-    
-    small_conf=1 is typically set in the portworx.io/misc-args annotation:
-      -rt_opts small_conf=1
-    
-    It indicates TNA mode where arbiter nodes have lower resource requirements:
-      - Arbiter node: 4 CPU cores, 4 GB RAM
-      - Storage nodes: still require standard 8 CPU / 8 GB RAM minimum
-    
-    Returns:
-        Dict with detection results:
-        {
-            'detected': bool,
-            'location': str (where it was found),
-            'misc_args': str (full misc-args value if present),
-            'is_tna_mode': bool
-        }
-    """
-    result = {
-        'detected': False,
-        'location': None,
-        'misc_args': None,
-        'is_tna_mode': False
-    }
-    
-    if not stc_spec:
-        return result
-    
-    # Check cluster-level annotation: metadata.annotations['portworx.io/misc-args']
-    metadata = stc_spec.get('metadata', {})
-    annotations = metadata.get('annotations', {})
-    misc_args = annotations.get('portworx.io/misc-args', '')
-    
-    if misc_args:
-        result['misc_args'] = misc_args
-        if 'small_conf=1' in misc_args or 'small_conf = 1' in misc_args:
-            result['detected'] = True
-            result['location'] = 'metadata.annotations[portworx.io/misc-args]'
-            result['is_tna_mode'] = True
-    
-    # Check spec.runtimeOptions for small_conf
-    spec = stc_spec.get('spec', {})
-    runtime_options = spec.get('runtimeOptions', {})
-    if runtime_options and isinstance(runtime_options, dict):
-        if runtime_options.get('small_conf') == '1' or runtime_options.get('small_conf') == 1:
-            result['detected'] = True
-            result['location'] = 'spec.runtimeOptions'
-            result['is_tna_mode'] = True
-    
-    # Check node-level overrides: spec.nodes[].runtimeOptions
-    nodes_spec = spec.get('nodes', [])
-    if nodes_spec and isinstance(nodes_spec, list):
-        for i, node_spec in enumerate(nodes_spec):
-            node_rt_opts = node_spec.get('runtimeOptions', {})
-            if node_rt_opts and isinstance(node_rt_opts, dict):
-                if node_rt_opts.get('small_conf') == '1' or node_rt_opts.get('small_conf') == 1:
-                    result['detected'] = True
-                    result['location'] = f'spec.nodes[{i}].runtimeOptions'
-                    result['is_tna_mode'] = True
-            
-            # Also check miscArgs at node level
-            node_misc_args = node_spec.get('miscArgs', '')
-            if node_misc_args and ('small_conf=1' in node_misc_args or 'small_conf = 1' in node_misc_args):
-                result['detected'] = True
-                result['location'] = f'spec.nodes[{i}].miscArgs'
-                result['is_tna_mode'] = True
-    
-    return result
-
-
 class MigrationReadinessReporter:
     """Generates comprehensive migration readiness reports"""
 
@@ -2473,12 +2395,6 @@ def main():
         stc_spec = retriever.retrieve_stc_spec()
         cloud_storage_info = cloud_storage_validator.extract_cloud_storage_info(stc_spec)
         all_results.extend(cloud_storage_validator.validate_drive_types(cloud_storage_info))
-
-        # Detect small_conf (TNA - Two-Node with Arbiter) mode
-        logger.info("Checking for small_conf (TNA) configuration...")
-        small_conf_info = detect_small_conf(stc_spec)
-        if small_conf_info.get('detected'):
-            logger.info(f"small_conf detected at: {small_conf_info.get('location')}")
 
         # Drive type analysis is disabled - set empty values
         drive_conversion_plan = {}
@@ -3089,39 +3005,18 @@ def main():
             print(f"NODE CPU & MEMORY RESOURCE ANALYSIS")
             print(f"{'='*60}")
             
-            # Check for small_conf (TNA mode)
-            is_tna_mode = small_conf_info.get('detected', False)
-            
             min_cpu = config.storev2_min_cpu_cores
             min_mem = config.storev2_min_memory_gb
             rec_cpu = config.storev2_recommended_cpu_cores
             rec_mem = config.storev2_recommended_memory_gb
             
-            # TNA/small_conf mode values
-            tna_min_cpu = config.small_conf_min_cpu_cores
-            tna_min_mem = config.small_conf_min_memory_gb
-            
             print(f"\nStoreV2 Requirements:")
             print(f"  Minimum:     {min_cpu} CPU cores, {min_mem:.0f} GB RAM")
             print(f"  Recommended: {rec_cpu} CPU cores, {rec_mem:.0f} GB RAM")
             
-            # Show TNA/small_conf status
-            if is_tna_mode:
-                print(f"\n📋 TNA MODE DETECTED (small_conf=1)")
-                print(f"   Location: {small_conf_info.get('location', 'Unknown')}")
-                print(f"   Arbiter node minimum: {tna_min_cpu} CPU cores, {tna_min_mem:.0f} GB RAM")
-                print(f"   Storage nodes: Standard requirements apply ({min_cpu} CPU, {min_mem:.0f} GB)")
-                if small_conf_info.get('misc_args'):
-                    print(f"   misc-args: {small_conf_info.get('misc_args')[:60]}{'...' if len(small_conf_info.get('misc_args', '')) > 60 else ''}")
-            else:
-                print(f"\n📋 Standard Mode (small_conf not detected)")
-            
             nodes_below_min = []
             nodes_below_recommended = []
             nodes_meets_recommended = []
-            
-            # In TNA mode, we'll note nodes that meet TNA requirements but not standard
-            nodes_meets_tna_only = []
             
             print(f"\n{'Node':<35} {'CPU':<8} {'Memory (GB)':<12} {'Status'}")
             print(f"{'-'*35} {'-'*8} {'-'*12} {'-'*20}")
@@ -3134,69 +3029,43 @@ def main():
                 # Truncate node name for display
                 display_name = node_name[:33] + '..' if len(node_name) > 35 else node_name
                 
-                # Check against standard requirements
-                meets_standard_min = cpu >= min_cpu and mem_gb >= min_mem
-                meets_recommended = cpu >= rec_cpu and mem_gb >= rec_mem
-                
-                # Check against TNA requirements (for arbiter nodes)
-                meets_tna_min = cpu >= tna_min_cpu and mem_gb >= tna_min_mem
-                
-                if meets_recommended:
-                    status = "✅ OK"
-                    nodes_meets_recommended.append(node_name)
-                elif meets_standard_min:
-                    status = "⚠️  BELOW RECOMMENDED"
-                    nodes_below_recommended.append({
-                        'name': node_name,
-                        'cpu': cpu,
-                        'memory_gb': mem_gb
-                    })
-                elif is_tna_mode and meets_tna_min:
-                    # In TNA mode, nodes meeting TNA min but not standard get a different status
-                    status = "⚠️  TNA ARBITER OK"
-                    nodes_meets_tna_only.append({
-                        'name': node_name,
-                        'cpu': cpu,
-                        'memory_gb': mem_gb
-                    })
-                else:
+                if cpu < min_cpu or mem_gb < min_mem:
                     status = "🚫 BELOW MINIMUM"
                     nodes_below_min.append({
                         'name': node_name,
                         'cpu': cpu,
                         'memory_gb': mem_gb
                     })
+                elif cpu < rec_cpu or mem_gb < rec_mem:
+                    status = "⚠️  BELOW RECOMMENDED"
+                    nodes_below_recommended.append({
+                        'name': node_name,
+                        'cpu': cpu,
+                        'memory_gb': mem_gb
+                    })
+                else:
+                    status = "✅ OK"
+                    nodes_meets_recommended.append(node_name)
                 
                 print(f"{display_name:<35} {cpu:<8.0f} {mem_gb:<12.1f} {status}")
             
             # Summary
             print(f"\n📊 Resource Summary:")
             
-            if is_tna_mode and nodes_meets_tna_only:
-                print(f"\nℹ️  TNA MODE NODES ({len(nodes_meets_tna_only)}):")
-                print(f"   These nodes meet TNA/arbiter requirements ({tna_min_cpu} CPU, {tna_min_mem:.0f} GB)")
-                print(f"   but not standard storage node requirements ({min_cpu} CPU, {min_mem:.0f} GB)")
-                for node in nodes_meets_tna_only[:5]:
-                    print(f"   - {node['name']}: CPU: {node['cpu']:.0f}, Memory: {node['memory_gb']:.1f} GB")
-                if len(nodes_meets_tna_only) > 5:
-                    print(f"   ... and {len(nodes_meets_tna_only) - 5} more")
-            
             if nodes_below_min:
                 print(f"\n🚫 NODES BELOW MINIMUM REQUIREMENTS ({len(nodes_below_min)}):")
-                effective_min_cpu = tna_min_cpu if is_tna_mode else min_cpu
-                effective_min_mem = tna_min_mem if is_tna_mode else min_mem
-                print(f"   CRITICAL: These nodes do not meet {'TNA arbiter' if is_tna_mode else 'StoreV2'} minimum requirements")
+                print(f"   CRITICAL: These nodes do not meet StoreV2 minimum requirements")
                 for node in nodes_below_min[:5]:
                     issues = []
-                    if node['cpu'] < effective_min_cpu:
-                        issues.append(f"CPU: {node['cpu']:.0f} < {effective_min_cpu}")
-                    if node['memory_gb'] < effective_min_mem:
-                        issues.append(f"Memory: {node['memory_gb']:.1f} GB < {effective_min_mem:.0f} GB")
+                    if node['cpu'] < min_cpu:
+                        issues.append(f"CPU: {node['cpu']:.0f} < {min_cpu}")
+                    if node['memory_gb'] < min_mem:
+                        issues.append(f"Memory: {node['memory_gb']:.1f} GB < {min_mem:.0f} GB")
                     print(f"   - {node['name']}: {', '.join(issues)}")
                 if len(nodes_below_min) > 5:
                     print(f"   ... and {len(nodes_below_min) - 5} more")
                 print(f"\n   ✏️  CORRECTIVE ACTION:")
-                print(f"   Upgrade nodes to meet minimum: {effective_min_cpu} CPU cores, {effective_min_mem:.0f} GB RAM")
+                print(f"   Upgrade nodes to meet minimum: {min_cpu} CPU cores, {min_mem:.0f} GB RAM")
                 print(f"   Or migrate workloads to nodes with sufficient resources")
             
             if nodes_below_recommended:
@@ -3212,14 +3081,12 @@ def main():
                 if len(nodes_below_recommended) > 5:
                     print(f"   ... and {len(nodes_below_recommended) - 5} more")
             
-            if not nodes_below_min and not nodes_below_recommended and not nodes_meets_tna_only:
+            if not nodes_below_min and not nodes_below_recommended:
                 print(f"   ✅ All {len(nodes_meets_recommended)} node(s) meet recommended resource requirements")
             else:
                 print(f"\n   Summary:")
                 print(f"   Meets recommended:     {len(nodes_meets_recommended)}")
                 print(f"   Below recommended:     {len(nodes_below_recommended)}")
-                if is_tna_mode:
-                    print(f"   TNA arbiter only:      {len(nodes_meets_tna_only)}")
                 print(f"   Below minimum:         {len(nodes_below_min)}")
 
         # Print pool priority analysis
@@ -3655,27 +3522,15 @@ def main():
             rec_cpu = config.storev2_recommended_cpu_cores
             rec_mem = config.storev2_recommended_memory_gb
             
-            # TNA mode uses lower requirements
-            tna_min_cpu = config.small_conf_min_cpu_cores
-            tna_min_mem = config.small_conf_min_memory_gb
-            is_tna = small_conf_info.get('detected', False)
-            
             nodes_below_min = 0
             nodes_below_recommended = 0
-            nodes_tna_only = 0
             for node_name, resources in node_resources.items():
                 capacity = resources.get('capacity', {})
                 cpu = capacity.get('cpu', 0)
                 mem_gb = capacity.get('memory_gb', 0)
                 
-                meets_standard_min = cpu >= min_cpu and mem_gb >= min_mem
-                meets_tna_min = cpu >= tna_min_cpu and mem_gb >= tna_min_mem
-                
                 if cpu < min_cpu or mem_gb < min_mem:
-                    if is_tna and meets_tna_min:
-                        nodes_tna_only += 1
-                    else:
-                        nodes_below_min += 1
+                    nodes_below_min += 1
                 elif cpu < rec_cpu or mem_gb < rec_mem:
                     nodes_below_recommended += 1
             
@@ -3683,20 +3538,10 @@ def main():
                 checks_failed.append("Node Resources (Below Minimum)")
             elif nodes_below_recommended > 0:
                 checks_warning.append("Node Resources (Below Recommended)")
-            elif nodes_tna_only > 0:
-                checks_warning.append("Node Resources (TNA Arbiter Only)")
             else:
                 checks_passed.append("Node Resources (CPU/Memory)")
         else:
             checks_skipped.append("Node Resources (No data)")
-
-        # 11. TNA (Two-Node with Arbiter) / small_conf Detection
-        checks_performed.append("TNA Mode (small_conf)")
-        if small_conf_info.get('detected', False):
-            # TNA mode is detected - this is informational, not a failure
-            checks_passed.append("TNA Mode (Detected)")
-        else:
-            checks_passed.append("TNA Mode (Standard Mode)")
 
         # Print summary table
         print(f"\n┌{'─'*68}┐")

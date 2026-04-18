@@ -153,7 +153,6 @@ StoreV2 Requirements:
   Minimum:     8 CPU cores, 8 GB RAM
   Recommended: 16 CPU cores, 16 GB RAM
 
-📋 Standard Mode (small_conf not detected)
 
 Node                                CPU      Memory (GB)  Status
 ----------------------------------- -------- ------------ --------------------
@@ -237,7 +236,6 @@ PER-NODE MIGRATION CAPACITY MAPPING
 │ Cluster Size (Min Nodes)                 ✅ PASSED                  │
 │ Metadata Node Labels                     ✅ PASSED                  │
 │ Node Disk Capacity                       ✅ PASSED                  │
-│ TNA Mode (Standard Mode)                 ✅ PASSED                  │
 │ Custom Labels/Metadata (Action Required) ⚠️  WARNING               │
 │ License (Trial - BLOCKED)                ❌ FAILED                  │
 │ Node Resources (Below Minimum)           ❌ FAILED                  │
