@@ -301,7 +301,8 @@ class STCDataRetriever:
                 'nodes': {},
                 'pools': {},
                 'cluster_id': None,
-                'cluster_uuid': None
+                'cluster_uuid': None,
+                'cluster_backend': None  # 'storev1', 'storev2', or 'mixed'
             },
             'license': {
                 'type': None,
@@ -376,6 +377,10 @@ class STCDataRetriever:
 
                         # Check if storage node (handles "Yes", "Yes(PX-StoreV2)", etc.)
                         if storage_node.lower().startswith('yes'):
+                            # Detect storage backend per node. The StorageNode
+                            # column reads "Yes" for StoreV1 and "Yes(PX-StoreV2)"
+                            # for nodes already migrated to StoreV2.
+                            node_backend = 'storev2' if 'storev2' in storage_node.lower() else 'storev1'
                             data['status']['nodes'][node_name] = {
                                 'id': node_id,
                                 'ip': node_ip,
@@ -384,6 +389,7 @@ class STCDataRetriever:
                                     'total': self._parse_size(f"{cap_val} {cap_unit}")
                                 },
                                 'status': status,
+                                'backend': node_backend,
                                 'labels': {},
                                 'annotations': {},
                                 'pools': []
@@ -392,6 +398,18 @@ class STCDataRetriever:
 
             if in_cluster_summary and 'Global Storage Pool' in line:
                 break
+
+        # Aggregate per-node backend into a cluster-level backend status so the
+        # caller can short-circuit when the cluster is already on StoreV2.
+        node_backends = {n.get('backend') for n in data['status']['nodes'].values() if n.get('backend')}
+        if not node_backends:
+            data['status']['cluster_backend'] = None
+        elif node_backends == {'storev2'}:
+            data['status']['cluster_backend'] = 'storev2'
+        elif node_backends == {'storev1'}:
+            data['status']['cluster_backend'] = 'storev1'
+        else:
+            data['status']['cluster_backend'] = 'mixed'
 
         logger.info(f"Parsed {nodes_parsed} storage nodes from pxctl status")
 
@@ -1667,48 +1685,73 @@ class MetadataConsistencyChecker:
                         nodes_with_false.append(node_name)
 
         # Rule 1 & 3: Fail if exactly 3 nodes have true AND there are nodes with false
+        # Only 3 effective metadata nodes is unsafe for KVDB failover during migration -
+        # a minimum of 4 metadata nodes is required.
         if len(nodes_with_true) == 3 and len(nodes_with_false) > 0:
             results.append(ValidationResult(
                 level=ValidationLevel.CRITICAL,
                 category="Metadata Node Labels",
-                message=f"Invalid px/metadata-node label configuration: 3 nodes with 'true' and {len(nodes_with_false)} nodes with 'false'",
+                message=f"Migration BLOCKED: only 3 metadata nodes (px/metadata-node=true) - minimum 4 metadata nodes required for StoreV2 migration ({len(nodes_with_false)} node(s) explicitly excluded with px/metadata-node=false)",
                 details={
                     "nodes_with_true": nodes_with_true,
                     "nodes_with_false": nodes_with_false,
-                    "nodes_without_label": nodes_without_label
+                    "nodes_without_label": nodes_without_label,
+                    "min_metadata_nodes_required": 4
                 },
                 recommendations=[
-                    "Migration cannot proceed with this label configuration",
-                    "Either remove the px/metadata-node=false labels from non-metadata nodes",
-                    "Or ensure proper metadata node distribution for StoreV2",
+                    "Migration cannot proceed: minimum 4 metadata nodes are required",
+                    "Add px/metadata-node=true labels to at least one additional node to reach the 4-node minimum",
+                    "Or remove the px/metadata-node=false labels from non-metadata nodes",
+                    "Run: kubectl label node <nodename> px/metadata-node=true",
                     "Run: kubectl label node <nodename> px/metadata-node-"
                 ]
             ))
 
         # Rule: Fail if all but 3 nodes are labeled as px/metadata-node=false
+        # Only 3 effective metadata nodes is unsafe - minimum 4 metadata nodes required.
         elif len(nodes_with_false) == total_nodes - 3:
             results.append(ValidationResult(
                 level=ValidationLevel.CRITICAL,
                 category="Metadata Node Labels",
-                message=f"Invalid px/metadata-node label configuration: {len(nodes_with_false)} of {total_nodes} nodes have px/metadata-node=false",
+                message=f"Migration BLOCKED: only 3 metadata nodes - minimum 4 metadata nodes required for StoreV2 migration ({len(nodes_with_false)} of {total_nodes} nodes have px/metadata-node=false)",
                 details={
                     "nodes_with_true": nodes_with_true,
                     "nodes_with_false": nodes_with_false,
-                    "nodes_without_label": nodes_without_label
+                    "nodes_without_label": nodes_without_label,
+                    "min_metadata_nodes_required": 4
                 },
                 recommendations=[
-                    "Migration cannot proceed with this label configuration",
-                    "Only 3 nodes are metadata nodes, which is not safe for migration",
-                    "Remove the px/metadata-node=false labels from non-metadata nodes",
+                    "Migration cannot proceed: minimum 4 metadata nodes are required",
+                    "Add px/metadata-node=true labels to at least one additional node to reach the 4-node minimum",
+                    "Or remove the px/metadata-node=false labels from non-metadata nodes",
+                    "Run: kubectl label node <nodename> px/metadata-node=true",
                     "Run: kubectl label node <nodename> px/metadata-node-"
                 ]
             ))
 
-        # Rule 2: OK if 3 nodes have true and others have no label (no error needed)
-        # Just log info for visibility
+        # Rule: Fail if exactly 3 nodes have px/metadata-node=true and the remaining
+        # nodes are unlabeled. Only 3 metadata nodes is unsafe for migration because
+        # KVDB will not fail over to the unlabeled nodes during a metadata-node
+        # decommission, causing the migration to get stuck.
         elif len(nodes_with_true) == 3 and len(nodes_with_false) == 0 and len(nodes_without_label) > 0:
-            # This is acceptable - no error
-            pass
+            results.append(ValidationResult(
+                level=ValidationLevel.CRITICAL,
+                category="Metadata Node Labels",
+                message=f"Migration BLOCKED: only 3 metadata nodes (px/metadata-node=true) - minimum 4 metadata nodes required for StoreV2 migration ({len(nodes_without_label)} of {total_nodes} nodes are unlabeled)",
+                details={
+                    "nodes_with_true": nodes_with_true,
+                    "nodes_with_false": nodes_with_false,
+                    "nodes_without_label": nodes_without_label,
+                    "min_metadata_nodes_required": 4
+                },
+                recommendations=[
+                    "Migration cannot proceed: minimum 4 metadata nodes are required",
+                    "Add px/metadata-node=true labels to at least one additional unlabeled node to reach the 4-node minimum",
+                    "Or remove the existing px/metadata-node=true labels so all nodes are eligible metadata nodes",
+                    "Run: kubectl label node <nodename> px/metadata-node=true",
+                    "Run: kubectl label node <nodename> px/metadata-node-"
+                ]
+            ))
 
         return results
 
@@ -1939,7 +1982,7 @@ class CloudStorageValidator:
             'device_specs': [],
             'kvdb_device_spec': None,
             'system_metadata_device_spec': None,
-            'drive_types': []
+            'drive_types': [],
         }
 
         if not stc_spec:
@@ -2009,12 +2052,17 @@ class CloudStorageValidator:
 
         provider = cloud_info.get('provider')
         drive_types = cloud_info.get('drive_types', [])
+        device_specs = cloud_info.get('device_specs', [])
 
         if not provider:
             # No cloud storage configured - not an error, might be on-prem
             return results
 
         if not drive_types:
+            # PURE FlashArray deviceSpecs use only size= (no type= parameter) — this
+            # is expected and valid; drive type validation does not apply.
+            if provider == 'pure' and device_specs:
+                return results
             results.append(ValidationResult(
                 level=ValidationLevel.WARNING,
                 category="Cloud Storage",
@@ -2228,21 +2276,21 @@ class MigrationReadinessReporter:
             report_lines.append("")
 
         # Custom Metadata Inventory
-        if metadata_inventory['labels'] or metadata_inventory['annotations']:
+        if metadata_inventory.get('pool_labels') or metadata_inventory.get('annotations'):
             report_lines.extend([
                 "CUSTOM METADATA REQUIRING MIGRATION",
                 "-" * 40
             ])
 
-            if metadata_inventory['labels']:
+            if metadata_inventory.get('pool_labels'):
                 report_lines.append("Labels:")
-                for label_key, values in metadata_inventory['labels'].items():
+                for label_key, values in metadata_inventory.get('pool_labels', {}).items():
                     report_lines.append(f"  {label_key}:")
                     for value, nodes in values.items():
                         report_lines.append(f"    {value}: {', '.join(nodes)}")
                 report_lines.append("")
 
-            if metadata_inventory['annotations']:
+            if metadata_inventory.get('annotations'):
                 report_lines.append("Annotations:")
                 for annotation_key, values in metadata_inventory['annotations'].items():
                     report_lines.append(f"  {annotation_key}:")
@@ -2251,7 +2299,7 @@ class MigrationReadinessReporter:
                 report_lines.append("")
 
         # Non-Default Pool Settings
-        if pool_settings_inventory['pools']:
+        if pool_settings_inventory.get('pools'):
             report_lines.extend([
                 "NON-DEFAULT POOL SETTINGS",
                 "-" * 40
@@ -2349,6 +2397,39 @@ def main():
 
         # Retrieve STC data
         stc_data = retriever.retrieve_stc_data()
+
+        # Early exit if the cluster is already migrated to StoreV2. Running the
+        # pre-migration validator against an already-migrated cluster produces
+        # misleading results, so skip all checks and report the state cleanly.
+        cluster_backend = stc_data.get('status', {}).get('cluster_backend')
+        if cluster_backend == 'storev2':
+            nodes = stc_data.get('status', {}).get('nodes', {})
+            print(f"\n{'='*70}")
+            print(f"{'CLUSTER ALREADY MIGRATED TO STOREV2':^70}")
+            print(f"{'='*70}")
+            print(f"\n✅ Detected {len(nodes)} node(s) already running on PX-StoreV2 backend.")
+            print(f"   Pre-migration validation is not required for this cluster.")
+            print(f"   No further checks will be performed.")
+            print(f"\n{'='*70}")
+            print(f"│ {'FINAL VERDICT: ✅ ALREADY MIGRATED - NO ACTION NEEDED':^66} │")
+            print(f"{'─'*70}")
+            sys.exit(0)
+        elif cluster_backend == 'mixed':
+            nodes = stc_data.get('status', {}).get('nodes', {})
+            v2_nodes = [n for n, d in nodes.items() if d.get('backend') == 'storev2']
+            v1_nodes = [n for n, d in nodes.items() if d.get('backend') == 'storev1']
+            print(f"\n{'='*70}")
+            print(f"{'CLUSTER MIGRATION IN PROGRESS (MIXED BACKENDS)':^70}")
+            print(f"{'='*70}")
+            print(f"\n⚠️  Cluster has nodes on both StoreV1 and StoreV2 backends:")
+            print(f"   StoreV2 nodes: {len(v2_nodes)}")
+            print(f"   StoreV1 nodes: {len(v1_nodes)}")
+            print(f"   A migration appears to be in progress or partially complete.")
+            print(f"   Re-running pre-migration validation is not appropriate.")
+            print(f"\n{'='*70}")
+            print(f"│ {'FINAL VERDICT: ⚠️  MIGRATION IN PROGRESS - SKIPPING CHECKS':^66} │")
+            print(f"{'─'*70}")
+            sys.exit(0)
 
         # Initialize validators
         sanity_checker = STCSanityChecker(config)
@@ -2772,6 +2853,8 @@ def main():
                     print(f"     - {st}")
             elif drive_types:
                 print(f"\n✅ All drive types are supported for StoreV2 migration")
+            elif cloud_storage_info.get('provider') == 'pure' and cloud_storage_info.get('device_specs'):
+                print(f"\n✅ PURE FlashArray detected - drive type not required in deviceSpecs")
             else:
                 print(f"\n⚠️  No drive types detected - verify cloudStorage configuration")
 
@@ -2823,26 +2906,44 @@ def main():
             print(f"  Nodes with 'false':    {len(nodes_with_false)}")
             print(f"  Nodes without label:   {len(nodes_without_label)}")
 
-            # Check for invalid configurations
+            # Check for invalid configurations - minimum 4 metadata nodes required for migration
             if len(nodes_with_true) == 3 and len(nodes_with_false) > 0:
-                print(f"\n🚫 METADATA NODE LABELS: FAILED")
-                print(f"   CRITICAL: 3 nodes have px/metadata-node=true AND {len(nodes_with_false)} nodes have px/metadata-node=false")
-                print(f"   This configuration is not supported for StoreV2 migration")
+                print(f"\n🚫 METADATA NODE LABELS: FAILED - MIGRATION BLOCKED")
+                print(f"   CRITICAL: Only 3 metadata nodes (px/metadata-node=true) - minimum 4 required for StoreV2 migration")
+                print(f"   3 nodes have px/metadata-node=true AND {len(nodes_with_false)} nodes have px/metadata-node=false")
                 print(f"\n   ✏️  CORRECTIVE ACTION:")
-                print(f"   Remove the false labels from non-metadata nodes:")
+                print(f"   Add px/metadata-node=true labels to at least one additional node to reach the 4-node minimum:")
+                for node in (nodes_without_label + nodes_with_false):
+                    print(f"     kubectl label node {node} px/metadata-node=true")
+                print(f"   Or remove the px/metadata-node=false labels from non-metadata nodes:")
                 for node in nodes_with_false:
                     print(f"     kubectl label node {node} px/metadata-node-")
             elif len(nodes_with_false) == px_node_count - 3:
-                print(f"\n🚫 METADATA NODE LABELS: FAILED")
-                print(f"   CRITICAL: {len(nodes_with_false)} of {px_node_count} Portworx nodes have px/metadata-node=false")
-                print(f"   Only 3 nodes are metadata nodes, which is not safe for migration")
+                print(f"\n🚫 METADATA NODE LABELS: FAILED - MIGRATION BLOCKED")
+                print(f"   CRITICAL: Only 3 metadata nodes - minimum 4 required for StoreV2 migration")
+                print(f"   {len(nodes_with_false)} of {px_node_count} Portworx nodes have px/metadata-node=false")
                 print(f"\n   ✏️  CORRECTIVE ACTION:")
-                print(f"   Remove the false labels from non-metadata nodes:")
+                print(f"   Add px/metadata-node=true labels to at least one additional node to reach the 4-node minimum:")
                 for node in nodes_with_false:
+                    print(f"     kubectl label node {node} px/metadata-node=true")
+                print(f"   Or remove the px/metadata-node=false labels from non-metadata nodes:")
+                for node in nodes_with_false:
+                    print(f"     kubectl label node {node} px/metadata-node-")
+            elif len(nodes_with_true) == 3 and len(nodes_with_false) == 0 and len(nodes_without_label) > 0:
+                print(f"\n🚫 METADATA NODE LABELS: FAILED - MIGRATION BLOCKED")
+                print(f"   CRITICAL: Only 3 metadata nodes (px/metadata-node=true) - minimum 4 required for StoreV2 migration")
+                print(f"   3 nodes have px/metadata-node=true AND {len(nodes_without_label)} of {px_node_count} Portworx nodes are unlabeled")
+                print(f"   KVDB will not fail over to unlabeled nodes during migration")
+                print(f"\n   ✏️  CORRECTIVE ACTION:")
+                print(f"   Add px/metadata-node=true labels to at least one additional unlabeled node to reach the 4-node minimum:")
+                for node in nodes_without_label:
+                    print(f"     kubectl label node {node} px/metadata-node=true")
+                print(f"   Or remove the existing px/metadata-node=true labels so all nodes are eligible:")
+                for node in nodes_with_true:
                     print(f"     kubectl label node {node} px/metadata-node-")
             elif len(nodes_with_true) == 3 and len(nodes_with_false) == 0:
                 print(f"\n✅ METADATA NODE LABELS: PASSED")
-                print(f"   3 metadata nodes designated, other nodes unlabeled (acceptable)")
+                print(f"   3 metadata nodes designated (acceptable)")
             else:
                 print(f"\n✅ METADATA NODE LABELS: PASSED")
 
@@ -3279,9 +3380,6 @@ def main():
 
             # Summary
             print(f"\n  " + "-"*76)
-            nodes_with_targets = sum(1 for n in node_capacity_info
-                                    for t in node_capacity_info
-                                    if t['name'] != n['name'] and t['free'] >= n['required_with_headroom'])
             total_nodes = len(node_capacity_info)
 
             nodes_fully_migratable = sum(1 for n in node_capacity_info
@@ -3489,7 +3587,7 @@ def main():
             # Get provider and max drives
             provider = ''
             if cloud_storage_info:
-                provider = cloud_storage_info.get('provider', '').lower()
+                provider = (cloud_storage_info.get('provider') or '').lower()
             max_drives = config.max_drives_per_node.get(provider, config.default_max_drives_per_node)
             
             # Check if any nodes are at or near capacity
