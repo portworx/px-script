@@ -663,9 +663,14 @@ class STCDataRetriever:
             # Detect manually attached volumes (attached via pxctl, not via Kubernetes)
             logger.info("Checking for manually attached volumes...")
             px_attached = self.retrieve_px_attached_volumes(ready_pods[0])
+            pod_used_pv_names = self.retrieve_pod_used_pv_names()
             manually_attached = {
                 vol: node for vol, node in px_attached.items()
+                # Not a K8s PV at all — created directly via pxctl
                 if vol not in k8s_pv_names
+                # K8s PV exists but no running pod is mounting it via a PVC.
+                # Kubernetes will not auto-detach this during a node drain.
+                or vol not in pod_used_pv_names
             }
             stc_data['manually_attached_volumes'] = manually_attached
 
@@ -895,12 +900,111 @@ class STCDataRetriever:
             logger.warning(f"Error retrieving node resources: {e}")
             return {}
 
+    def retrieve_k8s_pv_names(self) -> set:
+        """Return the set of all Kubernetes PersistentVolume names.
+
+        Used to distinguish K8s-managed volumes from volumes attached directly via
+        pxctl.  Portworx names its PX volumes after the K8s PV (both are
+        'pvc-<uuid>'), so a simple name lookup is sufficient.
+
+        This is more reliable than using VolumeAttachment objects because
+        in-tree Portworx volumes (kubernetes.io/portworx-volume) do not
+        create VolumeAttachment objects even when CSI migration is enabled.
+        """
+        try:
+            cmd = ['kubectl', 'get', 'pv', '-o', 'jsonpath={.items[*].metadata.name}']
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=60
+            )
+            names = set(result.stdout.split())
+            logger.info(f"Found {len(names)} Kubernetes PersistentVolume(s)")
+            return names
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Failed to get PersistentVolumes: {e.stderr}")
+            return set()
+        except Exception as e:
+            logger.warning(f"Error retrieving PersistentVolumes: {e}")
+            return set()
+
+    def retrieve_pod_used_pv_names(self) -> set:
+        """Return the set of PV names actively mounted by running or pending pods.
+
+        A volume that exists as a K8s PV but has no pod currently referencing its
+        PVC will not be automatically detached during a node drain — Kubernetes only
+        triggers CSI/volume detach when a pod holding the volume is evicted.  Such
+        volumes must be detached manually before migration, so we flag them the same
+        way as volumes attached outside Kubernetes entirely.
+        """
+        try:
+            # Collect (namespace, pvc_name) pairs referenced by running/pending pods
+            cmd = ['kubectl', 'get', 'pods', '-A', '-o', 'json']
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=60
+            )
+            pods_data = json.loads(result.stdout)
+
+            pod_pvc_refs: set = set()
+            for pod in pods_data.get('items', []):
+                phase = pod.get('status', {}).get('phase', '')
+                if phase not in ('Running', 'Pending'):
+                    continue
+                ns = pod['metadata']['namespace']
+                for vol in pod.get('spec', {}).get('volumes', []):
+                    claim_name = vol.get('persistentVolumeClaim', {}).get('claimName', '')
+                    if claim_name:
+                        pod_pvc_refs.add((ns, claim_name))
+
+            if not pod_pvc_refs:
+                logger.info("No PVCs referenced by running/pending pods")
+                return set()
+
+            # Map PVC names to PV names
+            cmd2 = ['kubectl', 'get', 'pvc', '-A', '-o', 'json']
+            result2 = subprocess.run(
+                cmd2,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=60
+            )
+            pvcs_data = json.loads(result2.stdout)
+
+            pv_names: set = set()
+            for pvc in pvcs_data.get('items', []):
+                ns = pvc['metadata']['namespace']
+                name = pvc['metadata']['name']
+                if (ns, name) in pod_pvc_refs:
+                    pv_name = pvc.get('spec', {}).get('volumeName', '')
+                    if pv_name:
+                        pv_names.add(pv_name)
+
+            logger.info(f"Found {len(pv_names)} PV(s) actively used by running/pending pods")
+            return pv_names
+
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Failed to retrieve pod PVC references: {e.stderr}")
+            return set()
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse pod/PVC JSON: {e}")
+            return set()
+        except Exception as e:
+            logger.warning(f"Error retrieving pod-used PV names: {e}")
+            return set()
+
     def retrieve_volume_attachments_per_node(self, px_nodes: List[str] = None) -> tuple:
         """Retrieve volume attachment counts per node using Kubernetes VolumeAttachment objects.
 
         Returns:
             Tuple of (node_attachments dict, k8s_pv_names set) where k8s_pv_names is the
-            set of PV names tracked by Kubernetes VolumeAttachment objects (i.e. CSI-managed).
+            set of all Kubernetes PV names (from kubectl get pv).
         """
         try:
             logger.info("Retrieving volume attachments per node...")
@@ -916,18 +1020,12 @@ class STCDataRetriever:
 
             attachments_data = json.loads(result.stdout)
             node_attachments = {}
-            k8s_pv_names = set()
 
             for attachment in attachments_data.get('items', []):
                 node_name = attachment.get('spec', {}).get('nodeName', '')
 
                 if not node_name:
                     continue
-
-                # Collect PV name so callers can detect manually attached volumes
-                pv_name = attachment.get('spec', {}).get('source', {}).get('persistentVolumeName', '')
-                if pv_name:
-                    k8s_pv_names.add(pv_name)
 
                 # Filter to px_nodes if provided
                 if px_nodes and node_name not in px_nodes:
@@ -949,17 +1047,22 @@ class STCDataRetriever:
                     node_attachments[node_name]['attaching'] += 1
 
             logger.info(f"Retrieved volume attachment info for {len(node_attachments)} nodes")
+
+            # Use PV names (not VolumeAttachment objects) to identify K8s-managed volumes.
+            # In-tree Portworx volumes don't create VolumeAttachment objects, so checking
+            # only VolumeAttachments produces false positives for every attached volume.
+            k8s_pv_names = self.retrieve_k8s_pv_names()
             return node_attachments, k8s_pv_names
 
         except subprocess.CalledProcessError as e:
             logger.warning(f"Failed to get volume attachments: {e.stderr}")
-            return {}, set()
+            return {}, self.retrieve_k8s_pv_names()
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse volume attachments JSON: {e}")
-            return {}, set()
+            return {}, self.retrieve_k8s_pv_names()
         except Exception as e:
             logger.warning(f"Error retrieving volume attachments: {e}")
-            return {}, set()
+            return {}, self.retrieve_k8s_pv_names()
 
     def retrieve_px_attached_volumes(self, pod_name: str) -> Dict[str, str]:
         """Return volumes currently attached in PX via pxctl volume list.
