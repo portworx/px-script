@@ -657,8 +657,17 @@ class STCDataRetriever:
 
             # Collect volume attachments per node
             logger.info("Collecting volume attachments per node...")
-            volume_attachments = self.retrieve_volume_attachments_per_node(px_nodes)
+            volume_attachments, k8s_pv_names = self.retrieve_volume_attachments_per_node(px_nodes)
             stc_data['volume_attachments'] = volume_attachments
+
+            # Detect manually attached volumes (attached via pxctl, not via Kubernetes)
+            logger.info("Checking for manually attached volumes...")
+            px_attached = self.retrieve_px_attached_volumes(ready_pods[0])
+            manually_attached = {
+                vol: node for vol, node in px_attached.items()
+                if vol not in k8s_pv_names
+            }
+            stc_data['manually_attached_volumes'] = manually_attached
 
             logger.info("Successfully retrieved and parsed Portworx data")
             return stc_data
@@ -886,28 +895,17 @@ class STCDataRetriever:
             logger.warning(f"Error retrieving node resources: {e}")
             return {}
 
-    def retrieve_volume_attachments_per_node(self, px_nodes: List[str] = None) -> Dict[str, Dict[str, Any]]:
-        """Retrieve volume attachment counts per node using Kubernetes VolumeAttachment objects
-        
-        Args:
-            px_nodes: List of node names to retrieve attachments for. If None, retrieves for all nodes.
-            
+    def retrieve_volume_attachments_per_node(self, px_nodes: List[str] = None) -> tuple:
+        """Retrieve volume attachment counts per node using Kubernetes VolumeAttachment objects.
+
         Returns:
-            Dict mapping node names to their attachment info:
-            {
-                'node-name': {
-                    'total_attachments': 25,
-                    'attached': 20,
-                    'attaching': 5
-                }
-            }
+            Tuple of (node_attachments dict, k8s_pv_names set) where k8s_pv_names is the
+            set of PV names tracked by Kubernetes VolumeAttachment objects (i.e. CSI-managed).
         """
         try:
             logger.info("Retrieving volume attachments per node...")
-            
-            # Get all VolumeAttachments
+
             cmd = ['kubectl', 'get', 'volumeattachments.storage.k8s.io', '-o', 'json']
-            
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -915,47 +913,77 @@ class STCDataRetriever:
                 check=True,
                 timeout=60
             )
-            
+
             attachments_data = json.loads(result.stdout)
             node_attachments = {}
-            
+            k8s_pv_names = set()
+
             for attachment in attachments_data.get('items', []):
                 node_name = attachment.get('spec', {}).get('nodeName', '')
-                
+
                 if not node_name:
                     continue
-                
+
+                # Collect PV name so callers can detect manually attached volumes
+                pv_name = attachment.get('spec', {}).get('source', {}).get('persistentVolumeName', '')
+                if pv_name:
+                    k8s_pv_names.add(pv_name)
+
                 # Filter to px_nodes if provided
                 if px_nodes and node_name not in px_nodes:
                     continue
-                
+
                 if node_name not in node_attachments:
                     node_attachments[node_name] = {
                         'total_attachments': 0,
                         'attached': 0,
                         'attaching': 0
                     }
-                
+
                 node_attachments[node_name]['total_attachments'] += 1
-                
-                # Check attachment status
+
                 status = attachment.get('status', {})
                 if status.get('attached', False):
                     node_attachments[node_name]['attached'] += 1
                 else:
                     node_attachments[node_name]['attaching'] += 1
-            
+
             logger.info(f"Retrieved volume attachment info for {len(node_attachments)} nodes")
-            return node_attachments
-            
+            return node_attachments, k8s_pv_names
+
         except subprocess.CalledProcessError as e:
             logger.warning(f"Failed to get volume attachments: {e.stderr}")
-            return {}
+            return {}, set()
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse volume attachments JSON: {e}")
-            return {}
+            return {}, set()
         except Exception as e:
             logger.warning(f"Error retrieving volume attachments: {e}")
+            return {}, set()
+
+    def retrieve_px_attached_volumes(self, pod_name: str) -> Dict[str, str]:
+        """Return volumes currently attached in PX via pxctl volume list.
+
+        Returns:
+            Dict mapping PX volume name to the node it is attached on.
+            Only volumes whose status contains 'attached on' are included.
+        """
+        import re
+        try:
+            output = self.exec_pxctl_command(pod_name, ['volume', 'list'])
+            attached = {}
+            for line in output.splitlines():
+                match = re.search(r'\battached\s+on\s+(\S+)', line, re.IGNORECASE)
+                if match:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        vol_name = parts[1]
+                        node_name = match.group(1)
+                        attached[vol_name] = node_name
+            logger.info(f"Found {len(attached)} PX volume(s) in attached state")
+            return attached
+        except Exception as e:
+            logger.warning(f"Failed to retrieve PX attached volumes: {e}")
             return {}
 
     def retrieve_stc_spec(self) -> Dict[str, Any]:
@@ -2803,6 +2831,24 @@ def main():
                 print(f"   Nodes near limit:   {len(nodes_near_limit)}")
                 print(f"   Nodes at limit:     {len(nodes_over_limit)}")
 
+        # Print manually attached volumes warning
+        manually_attached = stc_data.get('manually_attached_volumes', {})
+        if manually_attached:
+            print(f"\n{'='*60}")
+            print(f"MANUALLY ATTACHED VOLUMES")
+            print(f"{'='*60}")
+            print(f"\n⚠️  {len(manually_attached)} volume(s) are attached via pxctl (not via Kubernetes).")
+            print(f"   These volumes will NOT be detached automatically during migration.")
+            print(f"   drain-attachments will time out if they are not detached manually first.\n")
+            print(f"   {'Volume':<40} {'Node'}")
+            print(f"   {'-'*40} {'-'*40}")
+            for vol_name, node_name in manually_attached.items():
+                print(f"   {vol_name:<40} {node_name}")
+            print(f"\n   ✏️  CORRECTIVE ACTION:")
+            print(f"   Detach each volume manually before starting migration:")
+            for vol_name in manually_attached:
+                print(f"     pxctl volume detach {vol_name}")
+
         # Print cloud storage drive type validation
         if cloud_storage_info and cloud_storage_info.get('provider'):
             print(f"\n{'='*60}")
@@ -3481,6 +3527,14 @@ def main():
         else:
             checks_skipped.append("Volume Attachments (No data)")
 
+        # Manual attachment check
+        manually_attached = stc_data.get('manually_attached_volumes', {})
+        checks_performed.append("Manual Volume Attachments")
+        if manually_attached:
+            checks_warning.append(f"Manual Volume Attachments ({len(manually_attached)} volume(s) need manual detach)")
+        else:
+            checks_passed.append("Manual Volume Attachments")
+
         # 1. Pod Health Check
         pod_health_issues = [r for r in all_results if r.category == 'Pod Health']
         checks_performed.append("Pod Health (Containers Ready)")
@@ -3730,6 +3784,14 @@ def main():
                     print(f"     Actions:")
                     print(f"       → Document custom labels before migration")
                     print(f"       → Reapply custom labels to new pools after migration")
+                    warning_num += 1
+                elif "Manual Volume Attachments" in check_warning:
+                    manually_attached = stc_data.get('manually_attached_volumes', {})
+                    print(f"\n  {warning_num}. Manual Volume Attachments")
+                    print(f"     Issue: {len(manually_attached)} volume(s) attached via pxctl will not be detached automatically")
+                    print(f"     Actions:")
+                    print(f"       → Detach manually before migration: pxctl volume detach <vol>")
+                    print(f"       → Failure to do so will cause drain-attachments to time out")
                     warning_num += 1
         else:
             print(f"\n✅ No warnings found")
