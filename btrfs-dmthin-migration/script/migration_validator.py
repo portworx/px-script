@@ -119,8 +119,9 @@ class STCConfig:
 class STCDataRetriever:
     """Handles STC data retrieval via kubectl and pxctl"""
 
-    def __init__(self, namespace: str = None):
+    def __init__(self, namespace: str = None, admin_token: str = None):
         self.namespace = namespace
+        self.admin_token = admin_token
 
     def get_namespace(self) -> str:
         """Get namespace from user if not provided"""
@@ -273,7 +274,11 @@ class STCDataRetriever:
 
         try:
             logger.info(f"Executing pxctl {' '.join(command)} on pod: {pod_name}")
-            cmd = ['kubectl', '-n', namespace, 'exec', pod_name, '--'] + ['pxctl'] + command
+            pxctl_cmd = ['pxctl']
+            if self.admin_token:
+                pxctl_cmd.extend(['--token', self.admin_token])
+
+            cmd = ['kubectl', '-n', namespace, 'exec', pod_name, '--'] + pxctl_cmd + command
 
             result = subprocess.run(
                 cmd,
@@ -2508,6 +2513,10 @@ def main():
     parser.add_argument('-c', '--config', help='Configuration file path')
     parser.add_argument('-o', '--output', help='Output report file')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose logging')
+    parser.add_argument(
+        '--admin-token',
+        help='Portworx admin token for secure clusters; omit for non-secure clusters'
+    )
 
     args = parser.parse_args()
 
@@ -2519,7 +2528,10 @@ def main():
 
     try:
         # Initialize components
-        retriever = STCDataRetriever(namespace=args.namespace)
+        retriever = STCDataRetriever(
+            namespace=args.namespace,
+            admin_token=args.admin_token
+        )
 
         # Validate kubectl access
         if not retriever.validate_kubectl_access():
