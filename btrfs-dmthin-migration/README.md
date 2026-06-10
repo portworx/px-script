@@ -172,6 +172,7 @@ chmod +x migration_validator.py
 - `-n, --namespace`: Portworx namespace (will prompt if not provided)
 - `-o, --output`: Output report file (.txt for detailed report)
 - `-v, --verbose`: Enable debug logging
+- `--admin-token`: Portworx admin token for secure clusters
 
 ### Exit Codes
 - `0`: All validations passed - Ready for migration

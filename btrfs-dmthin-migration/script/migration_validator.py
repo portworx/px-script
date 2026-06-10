@@ -276,9 +276,12 @@ class STCDataRetriever:
             logger.info(f"Executing pxctl {' '.join(command)} on pod: {pod_name}")
             pxctl_cmd = ['pxctl']
             if self.admin_token:
-                pxctl_cmd.extend(['--token', self.admin_token])
-
-            cmd = ['kubectl', '-n', namespace, 'exec', pod_name, '--'] + pxctl_cmd + command
+                cmd = [
+                    'kubectl', '-n', namespace, 'exec', pod_name, '--',
+                    'sh', '-c', f'PXCTL_AUTH_TOKEN="{self.admin_token}" pxctl ' + ' '.join(command)
+                ]
+            else:
+                cmd = ['kubectl', '-n', namespace, 'exec', pod_name, '--'] + pxctl_cmd + command
 
             result = subprocess.run(
                 cmd,
@@ -1964,7 +1967,7 @@ class PoolConfigurationChecker:
                 pool_id = f"{pool_node}:{pool_name}"
 
                 # Check for offline pools
-                status = pool_data.get('status', '').lower()
+                status = (pool_data.get('status') or '').lower()
                 if status and status not in ['online', 'up', 'healthy', '']:
                     offline_pools[pool_id] = {
                         'pool': pool_name,
@@ -2132,7 +2135,7 @@ class CloudStorageValidator:
             return cloud_info
 
         # Extract provider
-        cloud_info['provider'] = cloud_storage.get('provider', '').lower()
+        cloud_info['provider'] = (cloud_storage.get('provider') or '').lower()
 
         # Extract device specs
         device_specs = cloud_storage.get('deviceSpecs', [])
@@ -3125,7 +3128,7 @@ def main():
                 pool_id = f"{pool_node}:{pool_name}"
 
                 # Check status
-                status = pool_data.get('status', '').lower()
+                status = (pool_data.get('status') or '').lower()
                 is_offline = status and status not in ['online', 'up', 'healthy', '']
 
                 # Check capacity
@@ -3192,7 +3195,7 @@ def main():
             # Get provider from cloud storage info for max drives lookup
             provider = ''
             if cloud_storage_info:
-                provider = cloud_storage_info.get('provider', '').lower()
+                provider = (cloud_storage_info.get('provider') or '').lower()
             
             max_drives = config.max_drives_per_node.get(provider, config.default_max_drives_per_node)
             max_drives_per_pool = config.max_drives_per_pool
