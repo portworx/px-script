@@ -119,8 +119,9 @@ class STCConfig:
 class STCDataRetriever:
     """Handles STC data retrieval via kubectl and pxctl"""
 
-    def __init__(self, namespace: str = None):
+    def __init__(self, namespace: str = None, admin_token: str = None):
         self.namespace = namespace
+        self.admin_token = admin_token
 
     def get_namespace(self) -> str:
         """Get namespace from user if not provided"""
@@ -273,7 +274,14 @@ class STCDataRetriever:
 
         try:
             logger.info(f"Executing pxctl {' '.join(command)} on pod: {pod_name}")
-            cmd = ['kubectl', '-n', namespace, 'exec', pod_name, '--'] + ['pxctl'] + command
+            pxctl_cmd = ['pxctl']
+            if self.admin_token:
+                cmd = [
+                    'kubectl', '-n', namespace, 'exec', pod_name, '--',
+                    'sh', '-c', f'PXCTL_AUTH_TOKEN="{self.admin_token}" pxctl ' + ' '.join(command)
+                ]
+            else:
+                cmd = ['kubectl', '-n', namespace, 'exec', pod_name, '--'] + pxctl_cmd + command
 
             result = subprocess.run(
                 cmd,
@@ -1959,7 +1967,7 @@ class PoolConfigurationChecker:
                 pool_id = f"{pool_node}:{pool_name}"
 
                 # Check for offline pools
-                status = pool_data.get('status', '').lower()
+                status = (pool_data.get('status') or '').lower()
                 if status and status not in ['online', 'up', 'healthy', '']:
                     offline_pools[pool_id] = {
                         'pool': pool_name,
@@ -2127,7 +2135,7 @@ class CloudStorageValidator:
             return cloud_info
 
         # Extract provider
-        cloud_info['provider'] = cloud_storage.get('provider', '').lower()
+        cloud_info['provider'] = (cloud_storage.get('provider') or '').lower()
 
         # Extract device specs
         device_specs = cloud_storage.get('deviceSpecs', [])
@@ -2508,6 +2516,10 @@ def main():
     parser.add_argument('-c', '--config', help='Configuration file path')
     parser.add_argument('-o', '--output', help='Output report file')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose logging')
+    parser.add_argument(
+        '--admin-token',
+        help='Portworx admin token for secure clusters; omit for non-secure clusters'
+    )
 
     args = parser.parse_args()
 
@@ -2519,7 +2531,10 @@ def main():
 
     try:
         # Initialize components
-        retriever = STCDataRetriever(namespace=args.namespace)
+        retriever = STCDataRetriever(
+            namespace=args.namespace,
+            admin_token=args.admin_token
+        )
 
         # Validate kubectl access
         if not retriever.validate_kubectl_access():
@@ -3113,7 +3128,7 @@ def main():
                 pool_id = f"{pool_node}:{pool_name}"
 
                 # Check status
-                status = pool_data.get('status', '').lower()
+                status = (pool_data.get('status') or '').lower()
                 is_offline = status and status not in ['online', 'up', 'healthy', '']
 
                 # Check capacity
@@ -3180,7 +3195,7 @@ def main():
             # Get provider from cloud storage info for max drives lookup
             provider = ''
             if cloud_storage_info:
-                provider = cloud_storage_info.get('provider', '').lower()
+                provider = (cloud_storage_info.get('provider') or '').lower()
             
             max_drives = config.max_drives_per_node.get(provider, config.default_max_drives_per_node)
             max_drives_per_pool = config.max_drives_per_pool
