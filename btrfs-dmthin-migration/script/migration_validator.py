@@ -618,13 +618,28 @@ class STCDataRetriever:
             # Store pod health info in stc_data for reporting
             stc_data['pod_health'] = pod_health
 
-            # Build pod to node mapping for drive info collection
+            # Build pod to node mapping using kubectl to get the actual k8s node name
+            # for each pod (pod name and pxctl node name can be completely different)
             pod_to_node_map = {}
-            for node_name in stc_data['status']['nodes'].keys():
-                for pod in ready_pods:
-                    if node_name in pod or pod in node_name:
-                        pod_to_node_map[pod] = node_name
-                        break
+            try:
+                cmd = [
+                    'kubectl', '-n', namespace, 'get', 'pods',
+                    '-l', 'name=portworx',
+                    '-o', 'jsonpath={range .items[*]}{.metadata.name}={.spec.nodeName}{\"\\n\"}{end}'
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+                for line in result.stdout.strip().splitlines():
+                    if '=' in line:
+                        pod_name, k8s_node = line.split('=', 1)
+                        pod_to_node_map[pod_name.strip()] = k8s_node.strip()
+                logger.info(f"Built pod-to-node map for {len(pod_to_node_map)} pods via kubectl")
+            except Exception as e:
+                logger.warning(f"Failed to build pod-to-node map via kubectl: {e}, falling back to name matching")
+                for node_name in stc_data['status']['nodes'].keys():
+                    for pod in ready_pods:
+                        if node_name in pod or pod in node_name:
+                            pod_to_node_map[pod] = node_name
+                            break
 
             # Collect pool information from each ready node
             logger.info("Collecting pool information from each node...")
@@ -633,20 +648,33 @@ class STCDataRetriever:
                     pool_output = self.exec_pxctl_command(pod, ['sv', 'pool', 'show'])
                     node_pools = self.parse_pxctl_pool_show(pool_output, pod)
 
-                    # Merge pool data
+                    # Resolve the actual node name for this pod
+                    resolved_node = pod_to_node_map.get(pod)
+
+                    # Merge pool data - use pod-scoped key to avoid overwriting
+                    # pools with the same ID from different nodes (e.g. pool-0)
                     for pool_name, pool_data in node_pools.items():
-                        stc_data['status']['pools'][pool_name] = pool_data
+                        scoped_pool_name = f"{pod}:{pool_name}"
+                        # Set node to the resolved k8s node name
+                        if resolved_node:
+                            pool_data['node'] = resolved_node
+                        stc_data['status']['pools'][scoped_pool_name] = pool_data
+                        pool_name = scoped_pool_name
 
                         # Find matching node and add pool reference
-                        for node_name, node_data in stc_data['status']['nodes'].items():
-                            if pod in node_name or node_data.get('ip') in pool_data.get('node', ''):
-                                node_data['pools'].append(pool_name)
-                                # Copy pool labels to node
-                                node_data['labels'].update(pool_data.get('labels', {}))
-                                # Update pod_to_node_map if not already mapped
-                                if pod not in pod_to_node_map:
-                                    pod_to_node_map[pod] = node_name
-                                break
+                        matched_node = resolved_node or None
+                        if not matched_node:
+                            # Fallback: match by IP or name containment
+                            for node_name, node_data in stc_data['status']['nodes'].items():
+                                if pod in node_name or node_data.get('ip') in pool_data.get('node', ''):
+                                    matched_node = node_name
+                                    break
+
+                        if matched_node and matched_node in stc_data['status']['nodes']:
+                            node_data = stc_data['status']['nodes'][matched_node]
+                            pool_data['node'] = matched_node
+                            node_data['pools'].append(pool_name)
+                            node_data['labels'].update(pool_data.get('labels', {}))
 
                 except Exception as e:
                     logger.warning(f"Failed to get pool info from pod {pod}: {e}")
@@ -2778,35 +2806,9 @@ def main():
             # Print custom pool labels that need migration
             if custom_pool_labels:
                 print(f"\n⚠️  CUSTOM POOL LABELS REQUIRING MIGRATION:")
-                print(f"   These labels must be manually applied to new storage pools post-migration:\n")
-
-                # Group by node for better readability
-                labels_by_node = {}
-                if metadata_inventory.get('pool_label_details'):
-                    for detail in metadata_inventory['pool_label_details']:
-                        # Skip system labels
-                        if detail['label_key'] in config.portworx_system_labels:
-                            continue
-                        if '.io/' in detail['label_key']:
-                            continue
-
-                        node = detail['node']
-                        if node not in labels_by_node:
-                            labels_by_node[node] = {}
-                        pool = detail['pool']
-                        if pool not in labels_by_node[node]:
-                            labels_by_node[node][pool] = {}
-                        labels_by_node[node][pool][detail['label_key']] = detail['label_value']
-
-                # Print details by node and pool
-                for node_name in sorted(labels_by_node.keys()):
-                    print(f"  Node: {node_name}")
-                    for pool_name in sorted(labels_by_node[node_name].keys()):
-                        print(f"    Pool: {pool_name}")
-                        for lbl_key, lbl_val in labels_by_node[node_name][pool_name].items():
-                            print(f"      {lbl_key}={lbl_val}")
-                    print()
-
+                print(f"   These labels must be manually applied to new storage pools post-migration.")
+                print(f"   See ACTION SUMMARY below for full details.")
+                print()
                 print(f"  📋 ACTION REQUIRED: Reapply these labels after migration")
             else:
                 print(f"\n✅ No custom pool labels detected - only system labels present")
@@ -3902,6 +3904,81 @@ def main():
                     print(f"     Actions:")
                     print(f"       → Document custom labels before migration")
                     print(f"       → Reapply custom labels to new pools after migration")
+                    # Build table of node/pool/label details
+                    # Each row: (node_name, node_uuid, pool_name, pool_id, label_str)
+                    table_rows = []
+                    nodes_data = stc_data.get('status', {}).get('nodes', {})
+                    pools_data = stc_data.get('status', {}).get('pools', {})
+                    if metadata_inventory.get('pool_label_details'):
+                        for detail in metadata_inventory['pool_label_details']:
+                            if detail['label_key'] in config.portworx_system_labels:
+                                continue
+                            if '.io/' in detail['label_key']:
+                                continue
+                            label_str = f"{detail['label_key']}={detail['label_value']}"
+                            # Strip node-scoped prefix from pool key (e.g. "pod:pool-0" -> "pool-0")
+                            pool_display = detail['pool'].split(':', 1)[-1] if ':' in detail['pool'] else detail['pool']
+                            # Look up node UUID from pxctl status
+                            node_uuid = nodes_data.get(detail['node'], {}).get('id', '')
+                            # Look up pool ID from pool data
+                            pool_id = pools_data.get(detail['pool'], {}).get('id', '')
+                            table_rows.append((detail['node'], node_uuid, pool_display, pool_id, label_str))
+                    if table_rows:
+                        # col1 fits both node name and [uuid] line
+                        col1 = max(max(len(r[0]) for r in table_rows),
+                                   max(len(f"[{r[1]}]") for r in table_rows),
+                                   len("Node"))
+                        col2 = max(len(r[2]) for r in table_rows)
+                        col2 = max(col2, len("Pool"))
+                        col3 = max(len(r[4]) for r in table_rows)
+                        col3 = max(col3, len("Custom Labels"))
+                        sep = f"     ┌{'─'*(col1+2)}┬{'─'*(col2+2)}┬{'─'*(col3+2)}┐"
+                        hdr = f"     │ {'Node':^{col1}} │ {'Pool':^{col2}} │ {'Custom Labels':^{col3}} │"
+                        mid = f"     ├{'─'*(col1+2)}┼{'─'*(col2+2)}┼{'─'*(col3+2)}┤"
+                        bot = f"     └{'─'*(col1+2)}┴{'─'*(col2+2)}┴{'─'*(col3+2)}┘"
+                        # Group rows by node, then by pool for vertical centering
+                        # row: (node, node_uuid, pool, pool_id, label)
+                        from itertools import groupby
+                        node_groups = []
+                        for node, node_rows in groupby(table_rows, key=lambda r: r[0]):
+                            node_rows = list(node_rows)
+                            node_uuid = node_rows[0][1]
+                            pool_groups = []
+                            for pool, pool_rows in groupby(node_rows, key=lambda r: r[2]):
+                                pool_rows = list(pool_rows)
+                                pool_id = pool_rows[0][3]
+                                pool_groups.append((pool, pool_id, [r[4] for r in pool_rows]))
+                            node_groups.append((node, node_uuid, pool_groups))
+
+                        print(sep)
+                        print(hdr)
+                        print(mid)
+                        for ni, (node, node_uuid, pool_groups) in enumerate(node_groups):
+                            # Each node occupies 2 lines per row (name + [uuid]), so
+                            # total_lines counts display lines for vertical centering
+                            total_rows = sum(len(labels) for _, _, labels in pool_groups)
+                            # Node name on first line, [uuid] on second — show at middle row pair
+                            node_mid_row = total_rows // 2
+                            row_idx = 0
+                            for pi, (pool, pool_id, labels) in enumerate(pool_groups):
+                                pool_mid_row = len(labels) // 2
+                                if pi > 0:
+                                    print(f"     │ {'':{col1}} ├{'─'*(col2+2)}┼{'─'*(col3+2)}┤")
+                                for li, label in enumerate(labels):
+                                    is_node_row = row_idx == node_mid_row
+                                    display_node = node if is_node_row else ''
+                                    display_pool = pool if li == pool_mid_row else ''
+                                    if li > 0:
+                                        print(f"     │ {'':{col1}} │ {'':{col2}} ├{'─'*(col3+2)}┤")
+                                    print(f"     │ {display_node:^{col1}} │ {display_pool:^{col2}} │ {label:<{col3}} │")
+                                    # Print [uuid] line directly below node name
+                                    if is_node_row and node_uuid:
+                                        uuid_str = f"[{node_uuid}]"
+                                        print(f"     │ {uuid_str:^{col1}} │ {'':{col2}} │ {'':{col3}} │")
+                                    row_idx += 1
+                            if ni < len(node_groups) - 1:
+                                print(mid)
+                        print(bot)
                     warning_num += 1
                 elif "Manual Volume Attachments" in check_warning:
                     manually_attached = stc_data.get('manually_attached_volumes', {})
