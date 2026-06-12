@@ -710,6 +710,10 @@ class STCDataRetriever:
             }
             stc_data['manually_attached_volumes'] = manually_attached
 
+            # Retrieve volume HA levels for replication check
+            vol_ha = self.retrieve_px_volume_ha_counts(ready_pods[0])
+            stc_data['volume_ha_counts'] = vol_ha
+
             logger.info("Successfully retrieved and parsed Portworx data")
             return stc_data
 
@@ -1125,6 +1129,25 @@ class STCDataRetriever:
             logger.warning(f"Failed to retrieve PX attached volumes: {e}")
             return {}
 
+    def retrieve_px_volume_ha_counts(self, pod_name: str) -> Dict[str, int]:
+        """Return {volume_name: ha_level} for all PX volumes via pxctl volume list."""
+        try:
+            output = self.exec_pxctl_command(pod_name, ['volume', 'list'])
+            volumes = {}
+            for line in output.splitlines():
+                parts = line.split('\t')
+                if len(parts) >= 4 and parts[0].strip().isdigit():
+                    vol_name = parts[1].strip()
+                    try:
+                        volumes[vol_name] = int(parts[3].strip())
+                    except ValueError:
+                        pass
+            logger.info(f"Found {len(volumes)} PX volume(s) with HA info")
+            return volumes
+        except Exception as e:
+            logger.warning(f"Failed to retrieve PX volume HA counts: {e}")
+            return {}
+
     def retrieve_stc_spec(self) -> Dict[str, Any]:
         """Retrieve StorageCluster spec via kubectl to get cloudStorage configuration"""
         namespace = self.get_namespace()
@@ -1314,6 +1337,32 @@ class STCSanityChecker:
 
             # Pool assignment checks disabled - not relevant for Portworx migration validation
             # Portworx automatically manages pool-to-node relationships
+
+        return results
+
+    def check_repl3_ha_reduction(self, stc_data: Dict[str, Any]) -> List[ValidationResult]:
+        """Warn if 3-node cluster has repl-3 volumes that will be temporarily reduced to HA=2 during migration."""
+        results = []
+
+        nodes = stc_data.get('status', {}).get('nodes', {})
+        if len(nodes) != 3:
+            return results
+
+        vol_ha = stc_data.get('volume_ha_counts', {})
+        repl3_vols = [name for name, ha in vol_ha.items() if ha == 3]
+
+        if repl3_vols:
+            results.append(ValidationResult(
+                level=ValidationLevel.WARNING,
+                category="HA Reduction",
+                message=f"{len(repl3_vols)} replication-3 volume(s) will be temporarily reduced to HA=2 during migration of each storage node (cluster has only 3 storage nodes)",
+                details={"repl3_volume_count": len(repl3_vols), "repl3_volumes": repl3_vols},
+                recommendations=[
+                    "During migration of each storage node, replication-3 volumes will temporarily run at HA=2",
+                    "Ensure no additional node failures occur during this window to avoid data unavailability",
+                    "HA=3 will be restored automatically after each node finishes migrating",
+                ]
+            ))
 
         return results
 
@@ -2654,6 +2703,7 @@ def main():
         all_results.extend(sanity_checker.check_missing_fields(stc_data))
         all_results.extend(sanity_checker.check_zero_values(stc_data))
         all_results.extend(sanity_checker.check_missing_pools_nodes(stc_data))
+        all_results.extend(sanity_checker.check_repl3_ha_reduction(stc_data))
 
         # Capacity analysis
         logger.info("Analyzing capacity requirements...")
@@ -3168,6 +3218,23 @@ def main():
                 print(f"   3 metadata nodes designated (acceptable)")
             else:
                 print(f"\n✅ METADATA NODE LABELS: PASSED")
+
+            # HA reduction warning for repl-3 volumes on 3-node clusters
+            if total_nodes == 3:
+                vol_ha = stc_data.get('volume_ha_counts', {})
+                repl3_vols = [name for name, ha in vol_ha.items() if ha == 3]
+                if repl3_vols:
+                    print(f"\n⚠️  VOLUME HA DURING MIGRATION: WARNING")
+                    print(f"   {len(repl3_vols)} replication-3 volume(s) will be temporarily reduced to HA=2 during migration of each storage node")
+                    print(f"   Ensure no additional node failures occur during this window to avoid data unavailability")
+                    print(f"   HA=3 will be restored automatically after each node finishes migrating")
+                    if len(repl3_vols) <= 10:
+                        print(f"\n   Affected volumes:")
+                        for vol in repl3_vols:
+                            print(f"     - {vol}")
+                else:
+                    print(f"\n✅ VOLUME HA DURING MIGRATION: PASSED")
+                    print(f"   No replication-3 volumes detected - no HA reduction will occur")
 
         # Print pool health analysis (offline/full pools)
         pools = stc_data.get('status', {}).get('pools', {})
@@ -3810,7 +3877,17 @@ def main():
         else:
             checks_passed.append("Metadata Node Labels")
 
-        # 9. Node Disk Capacity (available disk slots)
+        # 9. HA Reduction (repl-3 volumes on 3-node cluster)
+        ha_issues = [r for r in all_results if r.category == 'HA Reduction']
+        checks_performed.append("Volume HA During Migration")
+        if any(r.level in [ValidationLevel.CRITICAL, ValidationLevel.ERROR] for r in ha_issues):
+            checks_failed.append("Volume HA During Migration")
+        elif any(r.level == ValidationLevel.WARNING for r in ha_issues):
+            checks_warning.append("Volume HA During Migration")
+        else:
+            checks_passed.append("Volume HA During Migration")
+
+        # 10. Node Disk Capacity (available disk slots)
         node_drive_info = stc_data.get('node_drive_info', {})
         checks_performed.append("Node Disk Capacity")
         if node_drive_info:
