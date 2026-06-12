@@ -1772,14 +1772,21 @@ class MetadataConsistencyChecker:
 
         return inventory
 
-    def check_metadata_node_labels(self, stc_data: Dict[str, Any], k8s_node_labels: Dict[str, Dict[str, str]] = None) -> List[ValidationResult]:
+    def check_metadata_node_labels(self, stc_data: Dict[str, Any], k8s_node_labels: Dict[str, Dict[str, str]] = None, stc_spec: Dict[str, Any] = None) -> List[ValidationResult]:
         """Check px/metadata-node labels for StoreV2 migration requirements
 
         Args:
             stc_data: Portworx cluster data from pxctl (used for fallback node count)
             k8s_node_labels: Kubernetes node labels from kubectl - these are nodes where Portworx is running
+            stc_spec: StorageCluster CR from kubectl (used to check force-ack annotation)
         """
         results = []
+
+        # Check if the user has acknowledged the 3-node KVDB risk via annotation
+        force_ack = False
+        if stc_spec:
+            annotations = stc_spec.get('metadata', {}).get('annotations', {}) or {}
+            force_ack = annotations.get('portworx.io/migrate-storev1-to-v2-force-ack', '').lower() == 'true'
 
         # Use k8s_node_labels as the source of truth for Portworx nodes
         # This includes ALL nodes where Portworx is running, not just storage nodes
@@ -1804,19 +1811,30 @@ class MetadataConsistencyChecker:
             ))
             return results
 
-        # Rule 4: Fail if cluster has only 3 nodes
+        # Rule 4: Warn if cluster has only 3 nodes (KVDB can only run on 3 nodes)
         if total_nodes <= 3:
-            results.append(ValidationResult(
-                level=ValidationLevel.CRITICAL,
-                category="Cluster Size",
-                message=f"Cluster has only {total_nodes} node(s) running Portworx - minimum 4 nodes required for StoreV2 migration",
-                details={"total_nodes": total_nodes, "node_source": node_source},
-                recommendations=[
-                    "StoreV2 migration requires more than 3 Portworx nodes",
-                    "Add additional nodes to the cluster before migration",
-                    "Ensure at least 4 nodes are available for proper data distribution"
-                ]
-            ))
+            if force_ack:
+                results.append(ValidationResult(
+                    level=ValidationLevel.WARNING,
+                    category="Cluster Size",
+                    message=f"KVDB can only run on {total_nodes} node(s) - force-ack annotation found, migration will proceed with KVDB temporarily reduced to 2 members",
+                    details={"total_nodes": total_nodes, "node_source": node_source, "force_ack": True},
+                    recommendations=[
+                        "Monitor KVDB health closely during migration - it will temporarily run with only 2 members",
+                        "Ensure KVDB recovers to 3 members after migration completes",
+                    ]
+                ))
+            else:
+                results.append(ValidationResult(
+                    level=ValidationLevel.WARNING,
+                    category="Cluster Size",
+                    message=f"KVDB can only run on {total_nodes} node(s) - migrating a KVDB node will temporarily reduce KVDB members to 2",
+                    details={"total_nodes": total_nodes, "node_source": node_source, "force_ack": False},
+                    recommendations=[
+                        "To migrate this cluster, KVDB members must be temporarily reduced to 2 while a KVDB node is being migrated",
+                        "If you accept running with 2 KVDB nodes temporarily, add annotation to StorageCluster: kubectl annotate storagecluster <name> -n <namespace> portworx.io/migrate-storev1-to-v2-force-ack=true",
+                    ]
+                ))
             return results
 
         # Categorize nodes by px/metadata-node label
@@ -1851,74 +1869,90 @@ class MetadataConsistencyChecker:
                     elif str(metadata_label_value).lower() == 'false':
                         nodes_with_false.append(node_name)
 
-        # Rule 1 & 3: Fail if exactly 3 nodes have true AND there are nodes with false
-        # Only 3 effective metadata nodes is unsafe for KVDB failover during migration -
-        # a minimum of 4 metadata nodes is required.
+        # Rule 1 & 3: Warn if exactly 3 nodes have true AND there are nodes with false
+        # KVDB can only run on 3 nodes - migrating a KVDB node requires temporarily running with 2 members.
         if len(nodes_with_true) == 3 and len(nodes_with_false) > 0:
-            results.append(ValidationResult(
-                level=ValidationLevel.CRITICAL,
-                category="Metadata Node Labels",
-                message=f"Migration BLOCKED: only 3 metadata nodes (px/metadata-node=true) - minimum 4 metadata nodes required for StoreV2 migration ({len(nodes_with_false)} node(s) explicitly excluded with px/metadata-node=false)",
-                details={
-                    "nodes_with_true": nodes_with_true,
-                    "nodes_with_false": nodes_with_false,
-                    "nodes_without_label": nodes_without_label,
-                    "min_metadata_nodes_required": 4
-                },
-                recommendations=[
-                    "Migration cannot proceed: minimum 4 metadata nodes are required",
-                    "Add px/metadata-node=true labels to at least one additional node to reach the 4-node minimum",
-                    "Or remove the px/metadata-node=false labels from non-metadata nodes",
-                    "Run: kubectl label node <nodename> px/metadata-node=true",
-                    "Run: kubectl label node <nodename> px/metadata-node-"
-                ]
-            ))
+            if force_ack:
+                results.append(ValidationResult(
+                    level=ValidationLevel.WARNING,
+                    category="Metadata Node Labels",
+                    message=f"KVDB can only run on 3 metadata nodes (px/metadata-node=true) - force-ack annotation found, migration will proceed with KVDB temporarily reduced to 2 members ({len(nodes_with_false)} node(s) excluded with px/metadata-node=false)",
+                    details={"nodes_with_true": nodes_with_true, "nodes_with_false": nodes_with_false, "nodes_without_label": nodes_without_label, "force_ack": True},
+                    recommendations=[
+                        "Monitor KVDB health closely during migration - it will temporarily run with only 2 members",
+                        "Ensure KVDB recovers to 3 members after migration completes",
+                    ]
+                ))
+            else:
+                results.append(ValidationResult(
+                    level=ValidationLevel.WARNING,
+                    category="Metadata Node Labels",
+                    message=f"KVDB can only run on 3 metadata nodes (px/metadata-node=true) - migrating a KVDB node will temporarily reduce KVDB members to 2 ({len(nodes_with_false)} node(s) excluded with px/metadata-node=false)",
+                    details={"nodes_with_true": nodes_with_true, "nodes_with_false": nodes_with_false, "nodes_without_label": nodes_without_label, "force_ack": False},
+                    recommendations=[
+                        "To migrate KVDB nodes, KVDB members must be temporarily reduced to 2 during the migration of each KVDB node",
+                        "If you accept running with 2 KVDB nodes temporarily, add annotation to StorageCluster: kubectl annotate storagecluster <name> -n <namespace> portworx.io/migrate-storev1-to-v2-force-ack=true",
+                        "Alternatively, add px/metadata-node=true to at least one additional node to reach 4 KVDB nodes:",
+                        "Run: kubectl label node <nodename> px/metadata-node=true",
+                    ]
+                ))
 
-        # Rule: Fail if all but 3 nodes are labeled as px/metadata-node=false
-        # Only 3 effective metadata nodes is unsafe - minimum 4 metadata nodes required.
+        # Rule: Warn if all but 3 nodes are labeled as px/metadata-node=false
+        # KVDB can only run on 3 nodes - requires temporarily running with 2 members.
         elif len(nodes_with_false) == total_nodes - 3:
-            results.append(ValidationResult(
-                level=ValidationLevel.CRITICAL,
-                category="Metadata Node Labels",
-                message=f"Migration BLOCKED: only 3 metadata nodes - minimum 4 metadata nodes required for StoreV2 migration ({len(nodes_with_false)} of {total_nodes} nodes have px/metadata-node=false)",
-                details={
-                    "nodes_with_true": nodes_with_true,
-                    "nodes_with_false": nodes_with_false,
-                    "nodes_without_label": nodes_without_label,
-                    "min_metadata_nodes_required": 4
-                },
-                recommendations=[
-                    "Migration cannot proceed: minimum 4 metadata nodes are required",
-                    "Add px/metadata-node=true labels to at least one additional node to reach the 4-node minimum",
-                    "Or remove the px/metadata-node=false labels from non-metadata nodes",
-                    "Run: kubectl label node <nodename> px/metadata-node=true",
-                    "Run: kubectl label node <nodename> px/metadata-node-"
-                ]
-            ))
+            if force_ack:
+                results.append(ValidationResult(
+                    level=ValidationLevel.WARNING,
+                    category="Metadata Node Labels",
+                    message=f"KVDB can only run on 3 metadata nodes - force-ack annotation found, migration will proceed with KVDB temporarily reduced to 2 members ({len(nodes_with_false)} of {total_nodes} nodes have px/metadata-node=false)",
+                    details={"nodes_with_true": nodes_with_true, "nodes_with_false": nodes_with_false, "nodes_without_label": nodes_without_label, "force_ack": True},
+                    recommendations=[
+                        "Monitor KVDB health closely during migration - it will temporarily run with only 2 members",
+                        "Ensure KVDB recovers to 3 members after migration completes",
+                    ]
+                ))
+            else:
+                results.append(ValidationResult(
+                    level=ValidationLevel.WARNING,
+                    category="Metadata Node Labels",
+                    message=f"KVDB can only run on 3 metadata nodes - migrating a KVDB node will temporarily reduce KVDB members to 2 ({len(nodes_with_false)} of {total_nodes} nodes have px/metadata-node=false)",
+                    details={"nodes_with_true": nodes_with_true, "nodes_with_false": nodes_with_false, "nodes_without_label": nodes_without_label, "force_ack": False},
+                    recommendations=[
+                        "To migrate KVDB nodes, KVDB members must be temporarily reduced to 2 during the migration of each KVDB node",
+                        "If you accept running with 2 KVDB nodes temporarily, add annotation to StorageCluster: kubectl annotate storagecluster <name> -n <namespace> portworx.io/migrate-storev1-to-v2-force-ack=true",
+                        "Alternatively, add px/metadata-node=true to at least one additional node to reach 4 KVDB nodes:",
+                        "Run: kubectl label node <nodename> px/metadata-node=true",
+                    ]
+                ))
 
-        # Rule: Fail if exactly 3 nodes have px/metadata-node=true and the remaining
-        # nodes are unlabeled. Only 3 metadata nodes is unsafe for migration because
-        # KVDB will not fail over to the unlabeled nodes during a metadata-node
-        # decommission, causing the migration to get stuck.
+        # Rule: Warn if exactly 3 nodes have px/metadata-node=true and the remaining
+        # nodes are unlabeled. KVDB will not fail over to unlabeled nodes, so migrating
+        # a KVDB node requires temporarily running with 2 members.
         elif len(nodes_with_true) == 3 and len(nodes_with_false) == 0 and len(nodes_without_label) > 0:
-            results.append(ValidationResult(
-                level=ValidationLevel.CRITICAL,
-                category="Metadata Node Labels",
-                message=f"Migration BLOCKED: only 3 metadata nodes (px/metadata-node=true) - minimum 4 metadata nodes required for StoreV2 migration ({len(nodes_without_label)} of {total_nodes} nodes are unlabeled)",
-                details={
-                    "nodes_with_true": nodes_with_true,
-                    "nodes_with_false": nodes_with_false,
-                    "nodes_without_label": nodes_without_label,
-                    "min_metadata_nodes_required": 4
-                },
-                recommendations=[
-                    "Migration cannot proceed: minimum 4 metadata nodes are required",
-                    "Add px/metadata-node=true labels to at least one additional unlabeled node to reach the 4-node minimum",
-                    "Or remove the existing px/metadata-node=true labels so all nodes are eligible metadata nodes",
-                    "Run: kubectl label node <nodename> px/metadata-node=true",
-                    "Run: kubectl label node <nodename> px/metadata-node-"
-                ]
-            ))
+            if force_ack:
+                results.append(ValidationResult(
+                    level=ValidationLevel.WARNING,
+                    category="Metadata Node Labels",
+                    message=f"KVDB can only run on 3 metadata nodes (px/metadata-node=true) - force-ack annotation found, migration will proceed with KVDB temporarily reduced to 2 members ({len(nodes_without_label)} of {total_nodes} nodes are unlabeled)",
+                    details={"nodes_with_true": nodes_with_true, "nodes_with_false": nodes_with_false, "nodes_without_label": nodes_without_label, "force_ack": True},
+                    recommendations=[
+                        "Monitor KVDB health closely during migration - it will temporarily run with only 2 members",
+                        "Ensure KVDB recovers to 3 members after migration completes",
+                    ]
+                ))
+            else:
+                results.append(ValidationResult(
+                    level=ValidationLevel.WARNING,
+                    category="Metadata Node Labels",
+                    message=f"KVDB can only run on 3 metadata nodes (px/metadata-node=true) - migrating a KVDB node will temporarily reduce KVDB members to 2 ({len(nodes_without_label)} of {total_nodes} nodes are unlabeled; KVDB will not fail over to unlabeled nodes)",
+                    details={"nodes_with_true": nodes_with_true, "nodes_with_false": nodes_with_false, "nodes_without_label": nodes_without_label, "force_ack": False},
+                    recommendations=[
+                        "To migrate KVDB nodes, KVDB members must be temporarily reduced to 2 during the migration of each KVDB node",
+                        "If you accept running with 2 KVDB nodes temporarily, add annotation to StorageCluster: kubectl annotate storagecluster <name> -n <namespace> portworx.io/migrate-storev1-to-v2-force-ack=true",
+                        "Alternatively, add px/metadata-node=true to at least one additional unlabeled node to reach 4 KVDB nodes:",
+                        "Run: kubectl label node <nodename> px/metadata-node=true",
+                    ]
+                ))
 
         return results
 
@@ -2631,10 +2665,12 @@ def main():
         logger.info("Checking metadata consistency...")
         all_results.extend(metadata_checker.check_metadata_consistency(stc_data))
 
-        # Retrieve Kubernetes node labels for px/metadata-node check
+        # Retrieve Kubernetes node labels and StorageCluster spec
         logger.info("Retrieving Kubernetes node labels...")
         k8s_node_labels = retriever.retrieve_k8s_node_labels()
-        all_results.extend(metadata_checker.check_metadata_node_labels(stc_data, k8s_node_labels))
+        logger.info("Retrieving StorageCluster spec...")
+        stc_spec = retriever.retrieve_stc_spec()
+        all_results.extend(metadata_checker.check_metadata_node_labels(stc_data, k8s_node_labels, stc_spec))
         metadata_inventory = metadata_checker.inventory_custom_metadata(stc_data)
 
         # Pool configuration checks
@@ -2647,7 +2683,6 @@ def main():
         # Cloud storage drive type validation
         logger.info("Validating cloud storage drive types...")
         cloud_storage_validator = CloudStorageValidator(config)
-        stc_spec = retriever.retrieve_stc_spec()
         cloud_storage_info = cloud_storage_validator.extract_cloud_storage_info(stc_spec)
         all_results.extend(cloud_storage_validator.validate_drive_types(cloud_storage_info))
 
@@ -3034,11 +3069,23 @@ def main():
             total_nodes = len(nodes)
             print(f"\nTotal Storage Nodes: {total_nodes}")
 
+            # Extract force-ack annotation for display
+            force_ack_display = False
+            if stc_spec:
+                display_annotations = stc_spec.get('metadata', {}).get('annotations', {}) or {}
+                force_ack_display = display_annotations.get('portworx.io/migrate-storev1-to-v2-force-ack', '').lower() == 'true'
+
             # Check minimum node count
             if total_nodes <= 3:
-                print(f"\n🚫 CLUSTER SIZE CHECK: FAILED")
-                print(f"   CRITICAL: Cluster has only {total_nodes} node(s)")
-                print(f"   Minimum 4 nodes required for StoreV2 migration")
+                print(f"\n⚠️  CLUSTER SIZE CHECK: WARNING")
+                print(f"   KVDB can only run on {total_nodes} node(s) - migrating a KVDB node will temporarily reduce KVDB members to 2")
+                if force_ack_display:
+                    print(f"   ✅ Force-ack annotation found: migration will proceed with KVDB temporarily reduced to 2 members")
+                    print(f"   Monitor KVDB health closely during migration and ensure it recovers to 3 members afterward")
+                else:
+                    print(f"\n   ✏️  TO PROCEED:")
+                    print(f"   If you accept running with 2 KVDB nodes temporarily during migration, add the annotation:")
+                    print(f"     kubectl annotate storagecluster <name> -n <namespace> portworx.io/migrate-storev1-to-v2-force-ack=true")
             else:
                 print(f"\n✅ CLUSTER SIZE CHECK: PASSED ({total_nodes} nodes)")
 
@@ -3072,41 +3119,50 @@ def main():
             print(f"  Nodes with 'false':    {len(nodes_with_false)}")
             print(f"  Nodes without label:   {len(nodes_without_label)}")
 
-            # Check for invalid configurations - minimum 4 metadata nodes required for migration
+            # Check for 3-node KVDB configurations
             if len(nodes_with_true) == 3 and len(nodes_with_false) > 0:
-                print(f"\n🚫 METADATA NODE LABELS: FAILED - MIGRATION BLOCKED")
-                print(f"   CRITICAL: Only 3 metadata nodes (px/metadata-node=true) - minimum 4 required for StoreV2 migration")
+                print(f"\n⚠️  METADATA NODE LABELS: WARNING")
+                print(f"   KVDB can only run on 3 metadata nodes (px/metadata-node=true) - migrating a KVDB node will temporarily reduce KVDB members to 2")
                 print(f"   3 nodes have px/metadata-node=true AND {len(nodes_with_false)} nodes have px/metadata-node=false")
-                print(f"\n   ✏️  CORRECTIVE ACTION:")
-                print(f"   Add px/metadata-node=true labels to at least one additional node to reach the 4-node minimum:")
-                for node in (nodes_without_label + nodes_with_false):
-                    print(f"     kubectl label node {node} px/metadata-node=true")
-                print(f"   Or remove the px/metadata-node=false labels from non-metadata nodes:")
-                for node in nodes_with_false:
-                    print(f"     kubectl label node {node} px/metadata-node-")
+                if force_ack_display:
+                    print(f"   ✅ Force-ack annotation found: migration will proceed with KVDB temporarily reduced to 2 members")
+                    print(f"   Monitor KVDB health closely during migration and ensure it recovers to 3 members afterward")
+                else:
+                    print(f"\n   ✏️  TO PROCEED:")
+                    print(f"   If you accept running with 2 KVDB nodes temporarily during migration, add the annotation:")
+                    print(f"     kubectl annotate storagecluster <name> -n <namespace> portworx.io/migrate-storev1-to-v2-force-ack=true")
+                    print(f"   Or add px/metadata-node=true to at least one additional node to reach 4 KVDB nodes:")
+                    for node in (nodes_without_label + nodes_with_false):
+                        print(f"     kubectl label node {node} px/metadata-node=true")
             elif len(nodes_with_false) == px_node_count - 3:
-                print(f"\n🚫 METADATA NODE LABELS: FAILED - MIGRATION BLOCKED")
-                print(f"   CRITICAL: Only 3 metadata nodes - minimum 4 required for StoreV2 migration")
+                print(f"\n⚠️  METADATA NODE LABELS: WARNING")
+                print(f"   KVDB can only run on 3 metadata nodes - migrating a KVDB node will temporarily reduce KVDB members to 2")
                 print(f"   {len(nodes_with_false)} of {px_node_count} Portworx nodes have px/metadata-node=false")
-                print(f"\n   ✏️  CORRECTIVE ACTION:")
-                print(f"   Add px/metadata-node=true labels to at least one additional node to reach the 4-node minimum:")
-                for node in nodes_with_false:
-                    print(f"     kubectl label node {node} px/metadata-node=true")
-                print(f"   Or remove the px/metadata-node=false labels from non-metadata nodes:")
-                for node in nodes_with_false:
-                    print(f"     kubectl label node {node} px/metadata-node-")
+                if force_ack_display:
+                    print(f"   ✅ Force-ack annotation found: migration will proceed with KVDB temporarily reduced to 2 members")
+                    print(f"   Monitor KVDB health closely during migration and ensure it recovers to 3 members afterward")
+                else:
+                    print(f"\n   ✏️  TO PROCEED:")
+                    print(f"   If you accept running with 2 KVDB nodes temporarily during migration, add the annotation:")
+                    print(f"     kubectl annotate storagecluster <name> -n <namespace> portworx.io/migrate-storev1-to-v2-force-ack=true")
+                    print(f"   Or add px/metadata-node=true to at least one additional node to reach 4 KVDB nodes:")
+                    for node in nodes_with_false:
+                        print(f"     kubectl label node {node} px/metadata-node=true")
             elif len(nodes_with_true) == 3 and len(nodes_with_false) == 0 and len(nodes_without_label) > 0:
-                print(f"\n🚫 METADATA NODE LABELS: FAILED - MIGRATION BLOCKED")
-                print(f"   CRITICAL: Only 3 metadata nodes (px/metadata-node=true) - minimum 4 required for StoreV2 migration")
+                print(f"\n⚠️  METADATA NODE LABELS: WARNING")
+                print(f"   KVDB can only run on 3 metadata nodes (px/metadata-node=true) - migrating a KVDB node will temporarily reduce KVDB members to 2")
                 print(f"   3 nodes have px/metadata-node=true AND {len(nodes_without_label)} of {px_node_count} Portworx nodes are unlabeled")
                 print(f"   KVDB will not fail over to unlabeled nodes during migration")
-                print(f"\n   ✏️  CORRECTIVE ACTION:")
-                print(f"   Add px/metadata-node=true labels to at least one additional unlabeled node to reach the 4-node minimum:")
-                for node in nodes_without_label:
-                    print(f"     kubectl label node {node} px/metadata-node=true")
-                print(f"   Or remove the existing px/metadata-node=true labels so all nodes are eligible:")
-                for node in nodes_with_true:
-                    print(f"     kubectl label node {node} px/metadata-node-")
+                if force_ack_display:
+                    print(f"   ✅ Force-ack annotation found: migration will proceed with KVDB temporarily reduced to 2 members")
+                    print(f"   Monitor KVDB health closely during migration and ensure it recovers to 3 members afterward")
+                else:
+                    print(f"\n   ✏️  TO PROCEED:")
+                    print(f"   If you accept running with 2 KVDB nodes temporarily during migration, add the annotation:")
+                    print(f"     kubectl annotate storagecluster <name> -n <namespace> portworx.io/migrate-storev1-to-v2-force-ack=true")
+                    print(f"   Or add px/metadata-node=true to at least one additional unlabeled node to reach 4 KVDB nodes:")
+                    for node in nodes_without_label:
+                        print(f"     kubectl label node {node} px/metadata-node=true")
             elif len(nodes_with_true) == 3 and len(nodes_with_false) == 0:
                 print(f"\n✅ METADATA NODE LABELS: PASSED")
                 print(f"   3 metadata nodes designated (acceptable)")
