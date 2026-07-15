@@ -10,8 +10,11 @@ Date: February 2026
 """
 
 import json
+import os
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
 import yaml
@@ -19,6 +22,9 @@ import logging
 from enum import Enum
 import argparse
 from pathlib import Path
+
+
+DEFAULT_MAX_PARALLEL = int(os.environ.get('PX_MAX_PARALLEL', '8'))
 
 
 # Configure logging
@@ -119,9 +125,23 @@ class STCConfig:
 class STCDataRetriever:
     """Handles STC data retrieval via kubectl and pxctl"""
 
-    def __init__(self, namespace: str = None, admin_token: str = None):
+    def __init__(self, namespace: str = None, kubeconfig: str = None,
+                 max_parallel: int = DEFAULT_MAX_PARALLEL):
         self.namespace = namespace
-        self.admin_token = admin_token
+        self.kubeconfig = kubeconfig
+        self.max_parallel = max(1, max_parallel)
+        self._auth_token = None
+        self._auth_token_checked = False
+        self._auth_lock = threading.Lock()
+        self._context_lock = threading.Lock()
+        self._context_created: set = set()
+
+    def _kubectl_base(self) -> List[str]:
+        """Return base kubectl command with optional kubeconfig"""
+        cmd = ['kubectl']
+        if self.kubeconfig:
+            cmd.extend(['--kubeconfig', self.kubeconfig])
+        return cmd
 
     def get_namespace(self) -> str:
         """Get namespace from user if not provided"""
@@ -131,12 +151,88 @@ class STCDataRetriever:
                 raise ValueError("Namespace is required to proceed")
         return self.namespace
 
+    def _detect_auth_token(self) -> Optional[str]:
+        """Detect if cluster is px-secure and fetch auth token from px-user-token secret.
+
+        Thread-safe: multiple workers may call this concurrently; the lookup runs at most once.
+        """
+        # Fast path without acquiring the lock
+        if self._auth_token_checked:
+            return self._auth_token
+
+        with self._auth_lock:
+            if self._auth_token_checked:
+                return self._auth_token
+
+            namespace = self.get_namespace()
+
+            try:
+                import base64
+                # Try admin token first (has full access), then fall back to user token
+                for secret_name in ['px-admin-token', 'px-user-token']:
+                    cmd = self._kubectl_base() + [
+                        '-n', namespace, 'get', 'secret', secret_name,
+                        '-o', 'jsonpath={.data.auth-token}'
+                    ]
+                    result = subprocess.run(
+                        cmd, capture_output=True, text=True, timeout=15
+                    )
+
+                    if result.returncode == 0 and result.stdout.strip():
+                        token = base64.b64decode(result.stdout.strip()).decode('utf-8')
+                        if token:
+                            self._auth_token = token
+                            logger.info(f"Detected px-secure cluster — auth token acquired from {secret_name} secret")
+                            self._auth_token_checked = True
+                            return self._auth_token
+
+                logger.debug("No px-secure token found — cluster is not security-enabled")
+                self._auth_token_checked = True
+                return None
+
+            except Exception as e:
+                logger.debug(f"Auth token detection skipped: {e}")
+                self._auth_token_checked = True
+                return None
+
+    def _ensure_pxctl_context(self, pod_name: str) -> bool:
+        """Create pxctl auth context on the pod for px-secure clusters. Returns True if secure.
+
+        Idempotent per pod: the context is created at most once per (pod, process). Safe under
+        concurrent access from multiple worker threads.
+        """
+        auth_token = self._detect_auth_token()
+        if not auth_token:
+            return False
+
+        # Fast path — context already created on this pod
+        if pod_name in self._context_created:
+            return True
+
+        with self._context_lock:
+            if pod_name in self._context_created:
+                return True
+
+            namespace = self.get_namespace()
+            try:
+                cmd = self._kubectl_base() + [
+                    '-n', namespace, 'exec', pod_name, '-c', 'portworx', '--',
+                    '/opt/pwx/bin/pxctl', 'context', 'create', 'admin',
+                    f'--token={auth_token}'
+                ]
+                subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                self._context_created.add(pod_name)
+                return True
+            except Exception as e:
+                logger.debug(f"Failed to create pxctl context on {pod_name}: {e}")
+                return False
+
     def get_portworx_pods(self) -> List[str]:
         """Get list of Portworx pods"""
         namespace = self.get_namespace()
 
         try:
-            cmd = ['kubectl', '-n', namespace, 'get', 'pods', '-l', 'name=portworx',
+            cmd = self._kubectl_base() + ['-n', namespace, 'get', 'pods', '-l', 'name=portworx',
                    '-o', 'jsonpath={.items[*].metadata.name}']
 
             result = subprocess.run(
@@ -159,13 +255,61 @@ class STCDataRetriever:
             logger.error(error_msg)
             raise RuntimeError(error_msg)
 
+    def get_portworx_pods_with_nodes(self) -> List[Tuple[str, str]]:
+        """Get [(pod_name, node_name), ...] for Ready Portworx pods.
+
+        The nodeName lets callers filter to pods running on storage-capable nodes
+        before fanning out expensive per-pod pxctl calls, without an extra kubectl round-trip.
+        """
+        namespace = self.get_namespace()
+
+        try:
+            # Use a printable record separator ('|@|') instead of newline — kubectl's
+            # jsonpath parser rejects a literal newline delivered by the shell.
+            cmd = self._kubectl_base() + [
+                '-n', namespace, 'get', 'pods', '-l', 'name=portworx',
+                '-o',
+                'jsonpath={range .items[*]}{.metadata.name}{","}{.spec.nodeName}{","}'
+                '{.status.conditions[?(@.type=="Ready")].status}{"|@|"}{end}'
+            ]
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30
+            )
+
+            pods_with_nodes: List[Tuple[str, str]] = []
+            for record in result.stdout.strip().split('|@|'):
+                record = record.strip()
+                if not record:
+                    continue
+                parts = record.split(',')
+                if len(parts) < 2 or not parts[0] or not parts[1]:
+                    continue
+                pod_name, node_name = parts[0], parts[1]
+                ready = parts[2] if len(parts) >= 3 else ''
+                # Skip pods that aren't Ready — kubectl exec against them will hang/fail.
+                if ready and ready != 'True':
+                    continue
+                pods_with_nodes.append((pod_name, node_name))
+
+            return pods_with_nodes
+
+        except subprocess.CalledProcessError as e:
+            error_msg = f"Failed to get Portworx pods: {e.stderr}"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+
     def get_portworx_pod_health(self) -> Dict[str, Any]:
         """Get health status of all Portworx pods including container readiness"""
         namespace = self.get_namespace()
 
         try:
             # Get detailed pod info in JSON format
-            cmd = ['kubectl', '-n', namespace, 'get', 'pods', '-l', 'name=portworx',
+            cmd = self._kubectl_base() + ['-n', namespace, 'get', 'pods', '-l', 'name=portworx',
                    '-o', 'json']
 
             result = subprocess.run(
@@ -269,19 +413,23 @@ class STCDataRetriever:
         return pod_health['ready'], pod_health
 
     def exec_pxctl_command(self, pod_name: str, command: List[str]) -> str:
-        """Execute pxctl command on a Portworx pod"""
+        """Execute pxctl command on a Portworx pod (with auth context for px-secure clusters)"""
         namespace = self.get_namespace()
 
+        # Ensure pxctl auth context exists on the pod
+        is_secure = self._ensure_pxctl_context(pod_name)
+
         try:
-            logger.info(f"Executing pxctl {' '.join(command)} on pod: {pod_name}")
-            pxctl_cmd = ['pxctl']
-            if self.admin_token:
-                cmd = [
-                    'kubectl', '-n', namespace, 'exec', pod_name, '--',
-                    'sh', '-c', f'PXCTL_AUTH_TOKEN="{self.admin_token}" pxctl ' + ' '.join(command)
-                ]
-            else:
-                cmd = ['kubectl', '-n', namespace, 'exec', pod_name, '--'] + pxctl_cmd + command
+            logger.debug(f"Executing pxctl {' '.join(command)} on pod: {pod_name}")
+
+            pxctl_cmd = ['/opt/pwx/bin/pxctl']
+            if is_secure:
+                pxctl_cmd.extend(['--context', 'admin'])
+            pxctl_cmd.extend(command)
+
+            cmd = self._kubectl_base() + [
+                '-n', namespace, 'exec', pod_name, '-c', 'portworx', '--'
+            ] + pxctl_cmd
 
             result = subprocess.run(
                 cmd,
@@ -291,7 +439,7 @@ class STCDataRetriever:
                 timeout=60
             )
 
-            logger.info(f"Successfully executed pxctl {' '.join(command)}")
+            logger.debug(f"Successfully executed pxctl {' '.join(command)} on {pod_name}")
             return result.stdout
 
         except subprocess.CalledProcessError as e:
@@ -470,39 +618,44 @@ class STCDataRetriever:
         return drive_info
 
     def get_node_drive_info(self, ready_pods: List[str], pod_to_node_map: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
-        """Get drive information for each node using pxctl service drive show
-        
+        """Get drive information for each node using pxctl service drive show.
+
+        Fans out across pods in a bounded thread pool — each worker only runs the
+        pxctl exec; results are merged back on the main thread as they complete.
+
         Args:
             ready_pods: List of ready pod names
             pod_to_node_map: Mapping of pod names to node names
-            
+
         Returns:
             Dict mapping node names to their drive information
         """
         node_drive_info = {}
-        
-        for pod_name in ready_pods:
-            try:
-                drive_output = self.exec_pxctl_command(pod_name, ['service', 'drive', 'show'])
-                drive_info = self.parse_pxctl_drive_show(drive_output)
-                
-                # Map pod to node name if available
+        workers = min(self.max_parallel, max(1, len(ready_pods)))
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_pod = {
+                executor.submit(self.exec_pxctl_command, pod_name, ['service', 'drive', 'show']): pod_name
+                for pod_name in ready_pods
+            }
+            for future in as_completed(future_to_pod):
+                pod_name = future_to_pod[future]
                 node_name = pod_to_node_map.get(pod_name, pod_name)
-                node_drive_info[node_name] = drive_info
-                
-                logger.info(f"Node {node_name}: {drive_info['total_drives']} drive(s) detected")
-                
-            except Exception as e:
-                logger.warning(f"Failed to get drive info from pod {pod_name}: {e}")
-                # Store empty info on failure
-                node_name = pod_to_node_map.get(pod_name, pod_name)
-                node_drive_info[node_name] = {
-                    'total_drives': 0,
-                    'drives': [],
-                    'pool_drive_counts': {},
-                    'error': str(e)
-                }
-        
+                try:
+                    drive_output = future.result()
+                    drive_info = self.parse_pxctl_drive_show(drive_output)
+                    node_drive_info[node_name] = drive_info
+                    logger.info(f"Node {node_name}: {drive_info['total_drives']} drive(s) detected")
+                except Exception as e:
+                    logger.warning(f"Failed to get drive info from pod {pod_name}: {e}")
+                    # Store empty info on failure
+                    node_drive_info[node_name] = {
+                        'total_drives': 0,
+                        'drives': [],
+                        'pool_drive_counts': {},
+                        'error': str(e)
+                    }
+
         return node_drive_info
 
     def parse_pxctl_pool_show(self, pxctl_output: str, current_node: str) -> Dict[str, Any]:
@@ -610,43 +763,129 @@ class STCDataRetriever:
             # Get ready Portworx pods (validates health first)
             ready_pods, pod_health = self.get_ready_portworx_pods()
 
-            # Execute pxctl status on first available ready pod to get cluster-wide data
+            # Track nodes/pods that could not be queried so migration checks
+            # don't silently treat "no data" as "no issue"
+            query_errors = []
+
+            # Execute pxctl status on an available ready pod to get cluster-wide data.
+            # Try every ready pod (not just the first) since an individual pod's node
+            # can be unreachable (e.g. kubelet down) even though the pod is "ready".
             logger.info("Collecting cluster-wide status...")
-            pxctl_status_output = self.exec_pxctl_command(ready_pods[0], ['status'])
+            pxctl_status_output = None
+            status_pod = None
+            for pod in ready_pods:
+                try:
+                    pxctl_status_output = self.exec_pxctl_command(pod, ['status'])
+                    status_pod = pod
+                    break
+                except Exception as e:
+                    logger.warning(f"Failed to get pxctl status from pod {pod}: {e}")
+                    query_errors.append({
+                        'node': pod,
+                        'pod': pod,
+                        'stage': 'pxctl status',
+                        'error': str(e)
+                    })
+
+            if pxctl_status_output is None:
+                raise RuntimeError(
+                    f"Failed to get pxctl status from any of {len(ready_pods)} ready pod(s)"
+                )
+
             stc_data = self.parse_pxctl_status(pxctl_status_output)
-            
+
             # Store pod health info in stc_data for reporting
             stc_data['pod_health'] = pod_health
 
-            # Build pod to node mapping using kubectl to get the actual k8s node name
-            # for each pod (pod name and pxctl node name can be completely different)
+            # Build pod-to-node mapping. get_portworx_pods_with_nodes() already resolves
+            # each pod's k8s node name (pod name and pxctl node name can be completely
+            # different), so this reuses that single kubectl call instead of a second
+            # round trip.
             pod_to_node_map = {}
             try:
-                cmd = [
-                    'kubectl', '-n', namespace, 'get', 'pods',
-                    '-l', 'name=portworx',
-                    '-o', 'jsonpath={range .items[*]}{.metadata.name}={.spec.nodeName}{\"\\n\"}{end}'
-                ]
-                result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
-                for line in result.stdout.strip().splitlines():
-                    if '=' in line:
-                        pod_name, k8s_node = line.split('=', 1)
-                        pod_to_node_map[pod_name.strip()] = k8s_node.strip()
-                logger.info(f"Built pod-to-node map for {len(pod_to_node_map)} pods via kubectl")
+                pods_with_nodes = self.get_portworx_pods_with_nodes()
+                pod_to_node_map = {pod: node for pod, node in pods_with_nodes if pod in ready_pods}
             except Exception as e:
                 logger.warning(f"Failed to build pod-to-node map via kubectl: {e}, falling back to name matching")
-                for node_name in stc_data['status']['nodes'].keys():
-                    for pod in ready_pods:
-                        if node_name in pod or pod in node_name:
-                            pod_to_node_map[pod] = node_name
-                            break
 
-            # Collect pool information from each ready node
-            logger.info("Collecting pool information from each node...")
-            for pod in ready_pods:
-                try:
-                    pool_output = self.exec_pxctl_command(pod, ['sv', 'pool', 'show'])
-                    node_pools = self.parse_pxctl_pool_show(pool_output, pod)
+            # Fallback: match any ready pod missing from the map by name containment
+            for node_name in stc_data['status']['nodes'].keys():
+                for pod in ready_pods:
+                    if pod not in pod_to_node_map and (node_name in pod or pod in node_name):
+                        pod_to_node_map[pod] = node_name
+                        break
+
+            # Resolve node names for any pxctl status failures recorded above,
+            # now that the pod-to-node map is available
+            for err in query_errors:
+                err['node'] = pod_to_node_map.get(err['pod'], err['node'])
+
+            # Filter to pods running on storage-capable nodes. Storageless nodes have no
+            # pools/drives; querying them just wastes kubectl-exec RTTs. Match on both node
+            # name and node IP because pxctl status may report either depending on the
+            # cluster's label conventions.
+            storage_node_names = set(stc_data['status']['nodes'].keys())
+            storage_node_ips = {
+                data.get('ip') for data in stc_data['status']['nodes'].values()
+                if data.get('ip')
+            }
+            storage_pods = [
+                pod for pod in ready_pods
+                if pod_to_node_map.get(pod) in storage_node_names
+                or pod_to_node_map.get(pod) in storage_node_ips
+            ]
+
+            # Fallback safety: if the filter matched zero pods (e.g. node label scheme
+            # doesn't line up), fall back to querying every ready pod. Better to be slow
+            # than to skip real storage nodes.
+            if storage_pods:
+                query_pods = storage_pods
+                logger.info(
+                    f"Filtered {len(ready_pods)} PX pods → {len(query_pods)} on storage nodes "
+                    f"(skipping {len(ready_pods) - len(query_pods)} storageless)"
+                )
+            else:
+                query_pods = ready_pods
+                logger.warning(
+                    f"Storage-node filter matched 0 pods; falling back to all {len(query_pods)} pods"
+                )
+
+            # Warm the auth-token cache once up front so worker threads below don't race on it.
+            self._detect_auth_token()
+
+            # Collect pool information from each storage node — fan out across pods in a
+            # bounded thread pool since each pxctl exec is an independent kubectl round trip.
+            # Every future is resolved back on the main thread, so stc_data/query_errors
+            # mutation below needs no lock.
+            workers = min(self.max_parallel, max(1, len(query_pods)))
+            logger.info(
+                f"Collecting pool information from {len(query_pods)} pod(s) "
+                f"(parallel, up to {workers} concurrent)..."
+            )
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_to_pod = {
+                    executor.submit(self.exec_pxctl_command, pod, ['sv', 'pool', 'show']): pod
+                    for pod in query_pods
+                }
+                completed = 0
+                for future in as_completed(future_to_pod):
+                    pod = future_to_pod[future]
+                    completed += 1
+                    try:
+                        pool_output = future.result()
+                        node_pools = self.parse_pxctl_pool_show(pool_output, pod)
+                    except Exception as e:
+                        logger.warning(f"Failed to get pool info from pod {pod}: {e}")
+                        query_errors.append({
+                            'node': pod_to_node_map.get(pod, pod),
+                            'pod': pod,
+                            'stage': 'sv pool show',
+                            'error': str(e)
+                        })
+                        continue
+                    finally:
+                        if completed % 25 == 0 or completed == len(query_pods):
+                            logger.info(f"  pool-show progress: {completed}/{len(query_pods)}")
 
                     # Resolve the actual node name for this pod
                     resolved_node = pod_to_node_map.get(pod)
@@ -676,14 +915,19 @@ class STCDataRetriever:
                             node_data['pools'].append(pool_name)
                             node_data['labels'].update(pool_data.get('labels', {}))
 
-                except Exception as e:
-                    logger.warning(f"Failed to get pool info from pod {pod}: {e}")
-                    continue
-
-            # Collect drive information from each node
+            # Collect drive information from each storage node (also parallelized)
             logger.info("Collecting drive information from each node...")
-            node_drive_info = self.get_node_drive_info(ready_pods, pod_to_node_map)
+            node_drive_info = self.get_node_drive_info(query_pods, pod_to_node_map)
             stc_data['node_drive_info'] = node_drive_info
+            for node_name, drive_info in node_drive_info.items():
+                if drive_info.get('error'):
+                    query_errors.append({
+                        'node': node_name,
+                        'pod': next((p for p, n in pod_to_node_map.items() if n == node_name), node_name),
+                        'stage': 'service drive show',
+                        'error': drive_info['error']
+                    })
+            stc_data['query_errors'] = query_errors
 
             # Collect node CPU and memory resources
             logger.info("Collecting node CPU and memory resources...")
@@ -698,7 +942,7 @@ class STCDataRetriever:
 
             # Detect manually attached volumes (attached via pxctl, not via Kubernetes)
             logger.info("Checking for manually attached volumes...")
-            px_attached = self.retrieve_px_attached_volumes(ready_pods[0])
+            px_attached = self.retrieve_px_attached_volumes(status_pod)
             pod_used_pv_names = self.retrieve_pod_used_pv_names()
             manually_attached = {
                 vol: node for vol, node in px_attached.items()
@@ -711,7 +955,7 @@ class STCDataRetriever:
             stc_data['manually_attached_volumes'] = manually_attached
 
             # Retrieve volume HA levels for replication check
-            vol_ha = self.retrieve_px_volume_ha_counts(ready_pods[0])
+            vol_ha = self.retrieve_px_volume_ha_counts(status_pod)
             stc_data['volume_ha_counts'] = vol_ha
 
             logger.info("Successfully retrieved and parsed Portworx data")
@@ -726,7 +970,7 @@ class STCDataRetriever:
         """Validate kubectl access"""
         try:
             # Check kubectl is available
-            subprocess.run(['kubectl', 'version', '--client'],
+            subprocess.run(self._kubectl_base() + ['version', '--client'],
                          capture_output=True, check=True, timeout=10)
 
             logger.info("kubectl access validated successfully")
@@ -744,7 +988,7 @@ class STCDataRetriever:
             logger.info("Retrieving nodes where Portworx is running...")
 
             # Get Portworx pods with node information
-            cmd = ['kubectl', '-n', namespace, 'get', 'pods', '-l', 'name=portworx',
+            cmd = self._kubectl_base() + ['-n', namespace, 'get', 'pods', '-l', 'name=portworx',
                    '-o', 'jsonpath={.items[*].spec.nodeName}']
 
             result = subprocess.run(
@@ -781,7 +1025,7 @@ class STCDataRetriever:
                 px_nodes = self.retrieve_portworx_nodes()
 
             # Get all nodes with labels in JSON format
-            cmd = ['kubectl', 'get', 'nodes', '-o', 'json']
+            cmd = self._kubectl_base() + ['get', 'nodes', '-o', 'json']
 
             result = subprocess.run(
                 cmd,
@@ -893,7 +1137,7 @@ class STCDataRetriever:
                 return {}
             
             # Get all nodes in JSON format
-            cmd = ['kubectl', 'get', 'nodes', '-o', 'json']
+            cmd = self._kubectl_base() + ['get', 'nodes', '-o', 'json']
             
             result = subprocess.run(
                 cmd,
@@ -952,7 +1196,7 @@ class STCDataRetriever:
         create VolumeAttachment objects even when CSI migration is enabled.
         """
         try:
-            cmd = ['kubectl', 'get', 'pv', '-o', 'jsonpath={.items[*].metadata.name}']
+            cmd = self._kubectl_base() + ['get', 'pv', '-o', 'jsonpath={.items[*].metadata.name}']
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -981,7 +1225,7 @@ class STCDataRetriever:
         """
         try:
             # Collect (namespace, pvc_name) pairs referenced by running/pending pods
-            cmd = ['kubectl', 'get', 'pods', '-A', '-o', 'json']
+            cmd = self._kubectl_base() + ['get', 'pods', '-A', '-o', 'json']
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -1007,7 +1251,7 @@ class STCDataRetriever:
                 return set()
 
             # Map PVC names to PV names
-            cmd2 = ['kubectl', 'get', 'pvc', '-A', '-o', 'json']
+            cmd2 = self._kubectl_base() + ['get', 'pvc', '-A', '-o', 'json']
             result2 = subprocess.run(
                 cmd2,
                 capture_output=True,
@@ -1049,7 +1293,7 @@ class STCDataRetriever:
         try:
             logger.info("Retrieving volume attachments per node...")
 
-            cmd = ['kubectl', 'get', 'volumeattachments.storage.k8s.io', '-o', 'json']
+            cmd = self._kubectl_base() + ['get', 'volumeattachments.storage.k8s.io', '-o', 'json']
             result = subprocess.run(
                 cmd,
                 capture_output=True,
@@ -1156,7 +1400,7 @@ class STCDataRetriever:
             logger.info(f"Retrieving StorageCluster spec from namespace: {namespace}")
 
             # Get StorageCluster CR
-            cmd = ['kubectl', '-n', namespace, 'get', 'storagecluster', '-o', 'yaml']
+            cmd = self._kubectl_base() + ['-n', namespace, 'get', 'storagecluster', '-o', 'yaml']
 
             result = subprocess.run(
                 cmd,
@@ -2624,12 +2868,16 @@ def main():
 
     parser = argparse.ArgumentParser(description="STC Migration Validator")
     parser.add_argument('-n', '--namespace', help='STC namespace')
+    parser.add_argument('-k', '--kubeconfig', help='Path to kubeconfig file')
     parser.add_argument('-c', '--config', help='Configuration file path')
     parser.add_argument('-o', '--output', help='Output report file')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose logging')
     parser.add_argument(
-        '--admin-token',
-        help='Portworx admin token for secure clusters; omit for non-secure clusters'
+        '-p', '--max-parallel',
+        type=int,
+        default=DEFAULT_MAX_PARALLEL,
+        help=f'Max concurrent kubectl-exec workers for per-pod pxctl calls '
+             f'(default: {DEFAULT_MAX_PARALLEL}; env: PX_MAX_PARALLEL)'
     )
 
     args = parser.parse_args()
@@ -2644,7 +2892,8 @@ def main():
         # Initialize components
         retriever = STCDataRetriever(
             namespace=args.namespace,
-            admin_token=args.admin_token
+            kubeconfig=args.kubeconfig,
+            max_parallel=args.max_parallel,
         )
 
         # Validate kubectl access
@@ -2697,6 +2946,28 @@ def main():
 
         # Run validations
         all_results = []
+
+        # Nodes/pods that could not be queried (e.g. kubelet unreachable) must
+        # block migration rather than being silently skipped - proceeding
+        # without this data risks migrating a node in an unknown state.
+        query_errors = stc_data.get('query_errors', [])
+        if query_errors:
+            logger.error(f"{len(query_errors)} node(s)/pod(s) could not be queried during data collection")
+            for qe in query_errors:
+                all_results.append(ValidationResult(
+                    level=ValidationLevel.CRITICAL,
+                    category='Node Query Failure',
+                    message=(
+                        f"Could not inspect node '{qe['node']}' (pod {qe['pod']}) - "
+                        f"'{qe['stage']}' failed: {qe['error']}"
+                    ),
+                    details=qe,
+                    recommendations=[
+                        f"Check connectivity/health of node '{qe['node']}' and pod '{qe['pod']}'",
+                        "Fix the underlying issue (e.g. node unreachable, pod not ready)",
+                        "Re-run this validator once the node/pod can be queried successfully"
+                    ]
+                ))
 
         # Sanity checks
         logger.info("Running sanity checks...")
@@ -3900,16 +4171,23 @@ def main():
             # Check if any nodes are at or near capacity
             nodes_at_capacity = 0
             nodes_near_capacity = 0
+            nodes_query_failed = 0
             for node_name, drive_info in node_drive_info.items():
-                if not drive_info.get('error'):
-                    current_drives = drive_info.get('total_drives', 0)
-                    available_slots = max_drives - current_drives
-                    if available_slots <= 0:
-                        nodes_at_capacity += 1
-                    elif available_slots <= 2:
-                        nodes_near_capacity += 1
-            
-            if nodes_at_capacity > 0:
+                if drive_info.get('error'):
+                    nodes_query_failed += 1
+                    continue
+                current_drives = drive_info.get('total_drives', 0)
+                available_slots = max_drives - current_drives
+                if available_slots <= 0:
+                    nodes_at_capacity += 1
+                elif available_slots <= 2:
+                    nodes_near_capacity += 1
+
+            if nodes_query_failed > 0:
+                # Unable to determine capacity for some nodes - do not report
+                # this check as passed/warning since the data is incomplete.
+                checks_failed.append("Node Disk Capacity (Query Failed)")
+            elif nodes_at_capacity > 0:
                 checks_warning.append("Node Disk Capacity (At Limit)")
             elif nodes_near_capacity > 0:
                 checks_warning.append("Node Disk Capacity (Near Limit)")
