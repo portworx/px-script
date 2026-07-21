@@ -3591,6 +3591,19 @@ def main():
                 print(f"   Full:       {len(full_pools)}")
                 print(f"   Offline:    {len(offline_pools)}")
 
+        # Nodes we could not fully inspect: reported Offline by pxctl, and/or
+        # captured in query_errors when a ready pod's pxctl exec failed. These
+        # never appear in node_drive_info (no reachable pod to exec into), so we
+        # surface them explicitly in the tables below instead of silently
+        # dropping them.
+        _px_status_nodes = stc_data.get('status', {}).get('nodes', {})
+        _offline_nodes = {
+            name for name, ndata in _px_status_nodes.items()
+            if str(ndata.get('status', '')).strip().lower() not in ('online', 'up', 'ready', '')
+        }
+        _unreachable_nodes = {qe.get('node') for qe in stc_data.get('query_errors', []) if qe.get('node')}
+        unavailable_nodes = sorted(_offline_nodes | _unreachable_nodes)
+
         # Print disk capacity per node analysis
         node_drive_info = stc_data.get('node_drive_info', {})
         if node_drive_info:
@@ -3639,9 +3652,24 @@ def main():
                     nodes_with_capacity.append(node_name)
                 
                 print(f"{display_name:<40} {current_drives:<10} {max_drives:<8} {available_slots:<10} {status}")
-            
+
+            # Down/unreachable nodes have no ready pod to query, so they are
+            # absent from node_drive_info. List them here so the table reflects
+            # every node, not just the reachable ones.
+            nodes_down = [n for n in unavailable_nodes if n not in node_drive_info]
+            for node_name in nodes_down:
+                display_name = node_name[:38] + '..' if len(node_name) > 40 else node_name
+                print(f"{display_name:<40} {'-':<10} {max_drives:<8} {'-':<10} 🚫 NODE DOWN/UNREACHABLE")
+
             # Summary
             print(f"\n📊 Disk Slot Summary:")
+            if nodes_down:
+                print(f"\n🚫 NODES DOWN/UNREACHABLE ({len(nodes_down)}):")
+                print(f"   Disk slot usage is unknown until these nodes recover.")
+                for node in nodes_down[:5]:
+                    print(f"   - {node}")
+                if len(nodes_down) > 5:
+                    print(f"   ... and {len(nodes_down) - 5} more")
             if nodes_at_capacity:
                 print(f"\n🚫 NODES AT DISK CAPACITY ({len(nodes_at_capacity)}):")
                 print(f"   WARNING: These nodes cannot attach additional drives")
@@ -3661,13 +3689,15 @@ def main():
                 if len(nodes_near_capacity) > 5:
                     print(f"   ... and {len(nodes_near_capacity) - 5} more")
             
-            if not nodes_at_capacity and not nodes_near_capacity:
+            if not nodes_at_capacity and not nodes_near_capacity and not nodes_down:
                 print(f"   ✅ All {len(nodes_with_capacity)} node(s) have sufficient disk slots available")
             else:
                 print(f"\n   Summary:")
                 print(f"   Nodes with capacity:     {len(nodes_with_capacity)}")
                 print(f"   Nodes near capacity:     {len(nodes_near_capacity)}")
                 print(f"   Nodes at capacity:       {len(nodes_at_capacity)}")
+                if nodes_down:
+                    print(f"   Nodes down/unreachable:  {len(nodes_down)}")
 
         # Print node CPU and memory resource analysis
         node_resources = stc_data.get('node_resources', {})
@@ -3702,10 +3732,14 @@ def main():
                 display_name = node_name[:33] + '..' if len(node_name) > 35 else node_name
 
                 if not resources.get('ready', True):
-                    # Node is NotReady in k8s: the CPU/memory shown is stale
-                    # last-known capacity, so we can't certify it for StoreV2.
+                    # Node is NotReady in k8s: the CPU/memory k8s still serves is
+                    # stale last-known capacity, so we can't certify it for
+                    # StoreV2. Blank the values rather than print numbers that
+                    # look authoritative but can't be trusted.
                     status = "🚫 NODE DOWN/UNREACHABLE"
                     nodes_down.append(node_name)
+                    print(f"{display_name:<35} {'-':<8} {'-':<12} {status}")
+                    continue
                 elif cpu < min_cpu or mem_gb < min_mem:
                     status = "🚫 BELOW MINIMUM"
                     nodes_below_min.append({
@@ -4321,37 +4355,53 @@ def main():
         else:
             checks_skipped.append("Node Resources (No data)")
 
-        # Print summary table
-        print(f"\n┌{'─'*68}┐")
-        print(f"│ {'CHECK':40} {'STATUS':25} │")
-        print(f"├{'─'*68}┤")
+        # Print summary table.
+        # Build rows in a stable order: pass -> warning -> fail -> skip.
+        # (emoji, word) per status. Every emoji renders at 2 display columns,
+        # so keeping the "emoji + space + word" layout identical across rows
+        # keeps the right border aligned even though the emojis differ in
+        # codepoint count (⚠️/⏭️ carry a variation selector).
+        status_meta = {
+            'passed':  ('✅', 'PASSED'),
+            'warning': ('⚠️', 'WARNING'),
+            'failed':  ('❌', 'FAILED'),
+            'skipped': ('⏭️', 'SKIPPED'),
+        }
+        summary_rows = (
+            [(c, 'passed') for c in checks_passed]
+            + [(c, 'warning') for c in checks_warning]
+            + [(c, 'failed') for c in checks_failed]
+            + [(c, 'skipped') for c in checks_skipped]
+        )
 
-        # Print passed checks
-        for check in checks_passed:
-            print(f"│ {check:40} {'✅ PASSED':25} │")
+        # Size the CHECK column to the longest label (bounded), truncating with
+        # an ellipsis so nothing spills past the border.
+        max_name = 62
+        name_w = min(max(len('CHECK'), *(len(c) for c, _ in summary_rows)), max_name)
+        word_w = max(len(w) for _, w in status_meta.values())  # "WARNING" == 7
+        status_w = word_w + 3  # emoji (2 cols) + 1 space + word
 
-        # Print warning checks
-        for check in checks_warning:
-            print(f"│ {check:40} {'⚠️  WARNING':25} │")
+        print(f"\n┌{'─'*(name_w+2)}┬{'─'*(status_w+2)}┐")
+        print(f"│ {'CHECK':<{name_w}} │ {'STATUS':<{status_w}} │")
+        print(f"├{'─'*(name_w+2)}┼{'─'*(status_w+2)}┤")
 
-        # Print failed checks
-        for check in checks_failed:
-            print(f"│ {check:40} {'❌ FAILED':25} │")
+        for check, kind in summary_rows:
+            icon, word = status_meta[kind]
+            label = check if len(check) <= name_w else check[:name_w-1] + '…'
+            print(f"│ {label:<{name_w}} │ {icon} {word:<{word_w}} │")
 
-        # Print skipped checks
-        for check in checks_skipped:
-            print(f"│ {check:40} {'⏭️  SKIPPED':25} │")
+        print(f"└{'─'*(name_w+2)}┴{'─'*(status_w+2)}┘")
 
-        print(f"└{'─'*68}┘")
-
-        # Quick stats
+        # Quick stats. Every emoji renders at 2 display columns, so a fixed-width
+        # label after "emoji + space" keeps the counts aligned in one column.
         total_checks = len(checks_performed)
+        stat_w = len('Total Checks')  # longest label
         print(f"\n📊 QUICK STATS:")
-        print(f"   Total Checks: {total_checks}")
-        print(f"   ✅ Passed:    {len(checks_passed)}")
-        print(f"   ⚠️  Warnings:  {len(checks_warning)}")
-        print(f"   ❌ Failed:    {len(checks_failed)}")
-        print(f"   ⏭️  Skipped:   {len(checks_skipped)}")
+        print(f"   {'Total Checks':<{stat_w}}  {total_checks}")
+        print(f"   ✅ {'Passed':<{stat_w-3}}  {len(checks_passed)}")
+        print(f"   ⚠️ {'Warnings':<{stat_w-3}}  {len(checks_warning)}")
+        print(f"   ❌ {'Failed':<{stat_w-3}}  {len(checks_failed)}")
+        print(f"   ⏭️ {'Skipped':<{stat_w-3}}  {len(checks_skipped)}")
 
         # =====================================================================
         # DETAILED ACTION SUMMARY
