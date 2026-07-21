@@ -1159,7 +1159,16 @@ class STCDataRetriever:
                 status = node.get('status', {})
                 capacity = status.get('capacity', {})
                 allocatable = status.get('allocatable', {})
-                
+
+                # Capture the kubelet Ready condition. A down/unreachable node
+                # stays in the k8s API with its last-known capacity, so callers
+                # must not treat that stale capacity as a healthy node.
+                ready = False
+                for cond in status.get('conditions', []):
+                    if cond.get('type') == 'Ready':
+                        ready = (cond.get('status') == 'True')
+                        break
+
                 node_resources[node_name] = {
                     'capacity': {
                         'cpu': self._parse_cpu_to_cores(capacity.get('cpu', '0')),
@@ -1168,7 +1177,8 @@ class STCDataRetriever:
                     'allocatable': {
                         'cpu': self._parse_cpu_to_cores(allocatable.get('cpu', '0')),
                         'memory_gb': self._parse_memory_to_gb(allocatable.get('memory', '0'))
-                    }
+                    },
+                    'ready': ready
                 }
             
             logger.info(f"Retrieved resource info for {len(node_resources)} nodes")
@@ -3678,19 +3688,25 @@ def main():
             nodes_below_min = []
             nodes_below_recommended = []
             nodes_meets_recommended = []
-            
+            nodes_down = []
+
             print(f"\n{'Node':<35} {'CPU':<8} {'Memory (GB)':<12} {'Status'}")
             print(f"{'-'*35} {'-'*8} {'-'*12} {'-'*20}")
-            
+
             for node_name, resources in node_resources.items():
                 capacity = resources.get('capacity', {})
                 cpu = capacity.get('cpu', 0)
                 mem_gb = capacity.get('memory_gb', 0)
-                
+
                 # Truncate node name for display
                 display_name = node_name[:33] + '..' if len(node_name) > 35 else node_name
-                
-                if cpu < min_cpu or mem_gb < min_mem:
+
+                if not resources.get('ready', True):
+                    # Node is NotReady in k8s: the CPU/memory shown is stale
+                    # last-known capacity, so we can't certify it for StoreV2.
+                    status = "🚫 NODE DOWN/UNREACHABLE"
+                    nodes_down.append(node_name)
+                elif cpu < min_cpu or mem_gb < min_mem:
                     status = "🚫 BELOW MINIMUM"
                     nodes_below_min.append({
                         'name': node_name,
@@ -3707,12 +3723,23 @@ def main():
                 else:
                     status = "✅ OK"
                     nodes_meets_recommended.append(node_name)
-                
+
                 print(f"{display_name:<35} {cpu:<8.0f} {mem_gb:<12.1f} {status}")
             
             # Summary
             print(f"\n📊 Resource Summary:")
-            
+
+            if nodes_down:
+                print(f"\n🚫 NODES DOWN/UNREACHABLE ({len(nodes_down)}):")
+                print(f"   CRITICAL: Resource data for these nodes is stale (last-known)")
+                print(f"   and cannot be trusted for StoreV2 sizing until they recover.")
+                for node in nodes_down[:5]:
+                    print(f"   - {node}")
+                if len(nodes_down) > 5:
+                    print(f"   ... and {len(nodes_down) - 5} more")
+                print(f"\n   ✏️  CORRECTIVE ACTION:")
+                print(f"   Recover the node(s) and re-run this validator before migrating.")
+
             if nodes_below_min:
                 print(f"\n🚫 NODES BELOW MINIMUM REQUIREMENTS ({len(nodes_below_min)}):")
                 print(f"   CRITICAL: These nodes do not meet StoreV2 minimum requirements")
@@ -3742,13 +3769,14 @@ def main():
                 if len(nodes_below_recommended) > 5:
                     print(f"   ... and {len(nodes_below_recommended) - 5} more")
             
-            if not nodes_below_min and not nodes_below_recommended:
+            if not nodes_below_min and not nodes_below_recommended and not nodes_down:
                 print(f"   ✅ All {len(nodes_meets_recommended)} node(s) meet recommended resource requirements")
             else:
                 print(f"\n   Summary:")
                 print(f"   Meets recommended:     {len(nodes_meets_recommended)}")
                 print(f"   Below recommended:     {len(nodes_below_recommended)}")
                 print(f"   Below minimum:         {len(nodes_below_min)}")
+                print(f"   Down/unreachable:      {len(nodes_down)}")
 
         # Print pool priority analysis
         if pool_settings_inventory.get('pools'):
@@ -3895,11 +3923,16 @@ def main():
                 total = node_cap.get('total', 0)
                 used = node_cap.get('used', 0)
                 free = total - used
+                # A node reported as anything other than Online (e.g. Offline)
+                # is down. Its capacity figures are unreliable (often 0), which
+                # would otherwise make it look trivially migratable.
+                node_online = str(node_data.get('status', '')).strip().lower() in ('online', 'up', 'ready')
                 node_capacity_info.append({
                     'name': node_name,
                     'total': total,
                     'used': used,
                     'free': free,
+                    'online': node_online,
                     'required_with_headroom': used * (1 + headroom_pct / 100)
                 })
 
@@ -3911,17 +3944,21 @@ def main():
                 used_gb = node_info['used'] / (1024**3)
                 required_gb = node_info['required_with_headroom'] / (1024**3)
 
-                # Find nodes that can accept this node's data (have enough free capacity)
+                # Find nodes that can accept this node's data (have enough free
+                # capacity). Only online nodes are valid migration targets - a
+                # down node's reported free space can't be relied on.
                 eligible_targets = []
                 for target in node_capacity_info:
-                    if target['name'] != node_name:  # Can't migrate to self
+                    if target['name'] != node_name and target['online']:  # Can't migrate to self/down node
                         if target['free'] >= node_info['required_with_headroom']:
                             eligible_targets.append(target['name'])
 
                 # Truncate node name for display
                 display_name = node_name[:35] + '...' if len(node_name) > 38 else node_name
 
-                if eligible_targets:
+                if not node_info['online']:
+                    status = "🚫 NODE DOWN/UNREACHABLE - capacity unknown"
+                elif eligible_targets:
                     target_count = len(eligible_targets)
                     status = f"✅ {target_count} node(s) available"
                 else:
@@ -3930,7 +3967,7 @@ def main():
                 print(f"\n  {display_name}")
                 print(f"    Used: {used_gb:.1f} GB | Required: {required_gb:.1f} GB | {status}")
 
-                if eligible_targets:
+                if node_info['online'] and eligible_targets:
                     # Show up to 3 target nodes, truncate if more
                     if len(eligible_targets) <= 3:
                         targets_display = ", ".join(eligible_targets)
@@ -3941,17 +3978,35 @@ def main():
             # Summary
             print(f"\n  " + "-"*76)
             total_nodes = len(node_capacity_info)
+            down_nodes = [n['name'] for n in node_capacity_info if not n['online']]
 
-            nodes_fully_migratable = sum(1 for n in node_capacity_info
-                                        if any(t['free'] >= n['required_with_headroom']
-                                              for t in node_capacity_info if t['name'] != n['name']))
+            # Only online nodes can be certified as migratable; a down node's
+            # capacity is unknown and it can't serve as a target either.
+            nodes_fully_migratable = sum(
+                1 for n in node_capacity_info
+                if n['online'] and any(
+                    t['free'] >= n['required_with_headroom']
+                    for t in node_capacity_info
+                    if t['name'] != n['name'] and t['online']
+                )
+            )
 
-            if nodes_fully_migratable == total_nodes:
+            if down_nodes:
+                print(f"\n  🚫 {len(down_nodes)} node(s) DOWN/UNREACHABLE - migration mapping incomplete:")
+                for name in down_nodes[:5]:
+                    print(f"       - {name}")
+                if len(down_nodes) > 5:
+                    print(f"       ... and {len(down_nodes) - 5} more")
+                print(f"      Recover the node(s) and re-run before migrating.")
+
+            online_nodes = total_nodes - len(down_nodes)
+            if not down_nodes and nodes_fully_migratable == total_nodes:
                 print(f"\n  ✅ All {total_nodes} nodes have at least one eligible migration target")
             else:
-                blocked = total_nodes - nodes_fully_migratable
-                print(f"\n  ⚠️  {blocked} of {total_nodes} node(s) have no eligible migration target")
-                print(f"      Consider expanding storage on potential target nodes")
+                blocked = online_nodes - nodes_fully_migratable
+                if blocked > 0:
+                    print(f"\n  ⚠️  {blocked} of {online_nodes} online node(s) have no eligible migration target")
+                    print(f"      Consider expanding storage on potential target nodes")
         elif nodes:
             # Fallback to simple listing if no sizing recommendations
             for node_name, node_data in list(nodes.items())[:5]:
@@ -4003,6 +4058,34 @@ def main():
         checks_failed = []
         checks_warning = []
         checks_skipped = []
+
+        # Node reachability - determine up front so the per-node checks below
+        # (Disk Capacity, CPU/Memory) don't treat "no data" as "no issue" when a
+        # node is down/unreachable. A down node is either:
+        #   - reported Offline in the pxctl status cluster summary, and/or
+        #   - captured in query_errors when a ready pod's pxctl exec failed.
+        # In both cases we lack complete per-node data, so any check that only
+        # inspects the nodes it *could* reach would otherwise report green.
+        px_status_nodes = stc_data.get('status', {}).get('nodes', {})
+        offline_nodes = sorted(
+            name for name, ndata in px_status_nodes.items()
+            if str(ndata.get('status', '')).strip().lower() not in ('online', 'up', 'ready', '')
+        )
+        query_errors = stc_data.get('query_errors', [])
+        unreachable_nodes = sorted({qe.get('node') for qe in query_errors if qe.get('node')})
+        # Union of node names we could not fully inspect.
+        unavailable_nodes = sorted(set(offline_nodes) | set(unreachable_nodes))
+        nodes_unavailable = bool(unavailable_nodes)
+
+        # Node Reachability check (must surface down nodes in the summary table,
+        # not just in the ACTION SUMMARY / query_errors detail below).
+        checks_performed.append("Node Reachability")
+        if nodes_unavailable:
+            checks_failed.append(
+                f"Node Reachability ({len(unavailable_nodes)} node(s) down/unreachable)"
+            )
+        else:
+            checks_passed.append("Node Reachability")
 
         # 0. License Check (critical - must be first)
         license_info = stc_data.get('license', {})
@@ -4183,16 +4266,21 @@ def main():
                 elif available_slots <= 2:
                     nodes_near_capacity += 1
 
-            if nodes_query_failed > 0:
+            if nodes_query_failed > 0 or nodes_unavailable:
                 # Unable to determine capacity for some nodes - do not report
                 # this check as passed/warning since the data is incomplete.
-                checks_failed.append("Node Disk Capacity (Query Failed)")
+                # Down/unreachable nodes are never present in node_drive_info
+                # (they have no ready pod to exec into), so without this guard
+                # the check would silently pass on the reachable nodes alone.
+                checks_failed.append("Node Disk Capacity (Incomplete - node(s) down/unreachable)")
             elif nodes_at_capacity > 0:
                 checks_warning.append("Node Disk Capacity (At Limit)")
             elif nodes_near_capacity > 0:
                 checks_warning.append("Node Disk Capacity (Near Limit)")
             else:
                 checks_passed.append("Node Disk Capacity")
+        elif nodes_unavailable:
+            checks_failed.append("Node Disk Capacity (Incomplete - node(s) down/unreachable)")
         else:
             checks_skipped.append("Node Disk Capacity (No data)")
 
@@ -4219,10 +4307,17 @@ def main():
             
             if nodes_below_min > 0:
                 checks_failed.append("Node Resources (Below Minimum)")
+            elif nodes_unavailable:
+                # k8s still serves stale last-known capacity for a NotReady node,
+                # so node_resources can look complete even when a node is down.
+                # Don't claim a green pass when we can't trust every node's data.
+                checks_failed.append("Node Resources (Incomplete - node(s) down/unreachable)")
             elif nodes_below_recommended > 0:
                 checks_warning.append("Node Resources (Below Recommended)")
             else:
                 checks_passed.append("Node Resources (CPU/Memory)")
+        elif nodes_unavailable:
+            checks_failed.append("Node Resources (Incomplete - node(s) down/unreachable)")
         else:
             checks_skipped.append("Node Resources (No data)")
 
