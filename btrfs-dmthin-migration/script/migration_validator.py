@@ -935,6 +935,14 @@ class STCDataRetriever:
             node_resources = self.retrieve_node_resources(px_nodes)
             stc_data['node_resources'] = node_resources
 
+            # Detect storageless PX nodes that are down/NotReady in k8s. The Node
+            # Reachability check only covers storage nodes (pxctl status.nodes +
+            # query_errors on storage-node pods), so a down storageless node — which
+            # may still host a KVDB/metadata member — would otherwise go unreported.
+            # Only the down nodes are recorded; healthy storageless nodes are omitted.
+            logger.info("Checking storageless node health...")
+            stc_data['storageless_nodes_down'] = self.retrieve_unhealthy_storageless_nodes(px_nodes)
+
             # Collect volume attachments per node
             logger.info("Collecting volume attachments per node...")
             volume_attachments, k8s_pv_names = self.retrieve_volume_attachments_per_node(px_nodes)
@@ -1193,6 +1201,82 @@ class STCDataRetriever:
         except Exception as e:
             logger.warning(f"Error retrieving node resources: {e}")
             return {}
+
+    def retrieve_unhealthy_storageless_nodes(self, storage_node_names) -> List[Dict[str, Any]]:
+        """Detect storageless Portworx nodes that are down/NotReady in Kubernetes.
+
+        The primary Node Reachability check only inspects storage nodes (pxctl
+        status.nodes + query_errors from storage-node pods), so a down storageless
+        node — which still runs Portworx and may host a KVDB/metadata member — is
+        otherwise invisible. Only unhealthy nodes are returned; healthy storageless
+        nodes are intentionally omitted so we don't list the whole fleet.
+
+        Args:
+            storage_node_names: node names already accounted for as storage nodes
+                (from stc_data['status']['nodes']); everything else running
+                Portworx is treated as storageless.
+
+        Returns:
+            List of {'node': name, 'reason': <NotReady|Unreachable|NodeObjectMissing>,
+                     'metadata_node': bool} for the down storageless nodes only.
+        """
+        unhealthy = []
+        try:
+            all_px_nodes = self.retrieve_portworx_nodes()
+            storage_names = set(storage_node_names or [])
+            storageless_nodes = [n for n in all_px_nodes if n not in storage_names]
+            if not storageless_nodes:
+                return unhealthy
+
+            cmd = self._kubectl_base() + ['get', 'nodes', '-o', 'json']
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30
+            )
+            nodes_data = json.loads(result.stdout)
+
+            # Map every k8s node to its Ready condition status and metadata-node label.
+            node_info = {}
+            for node in nodes_data.get('items', []):
+                name = node.get('metadata', {}).get('name', '')
+                if not name:
+                    continue
+                labels = node.get('metadata', {}).get('labels', {}) or {}
+                ready = None
+                for cond in node.get('status', {}).get('conditions', []):
+                    if cond.get('type') == 'Ready':
+                        ready = cond.get('status')  # 'True' / 'False' / 'Unknown'
+                        break
+                node_info[name] = {
+                    'ready': ready,
+                    'metadata_node': str(labels.get('px/metadata-node', '')).lower() == 'true',
+                }
+
+            for name in sorted(storageless_nodes):
+                info = node_info.get(name)
+                if info is None:
+                    # k8s Node object is gone entirely — treat as down/unreachable.
+                    unhealthy.append({'node': name, 'reason': 'NodeObjectMissing', 'metadata_node': False})
+                elif info['ready'] != 'True':
+                    # 'False' => kubelet reports NotReady; 'Unknown'/None => kubelet unreachable.
+                    reason = 'NotReady' if info['ready'] == 'False' else 'Unreachable'
+                    unhealthy.append({'node': name, 'reason': reason, 'metadata_node': info['metadata_node']})
+
+            if unhealthy:
+                logger.warning(
+                    f"Detected {len(unhealthy)} storageless node(s) down/NotReady: "
+                    f"{', '.join(u['node'] for u in unhealthy)}"
+                )
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Failed to check storageless node health: {e.stderr}")
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse node JSON for storageless health check: {e}")
+        except Exception as e:
+            logger.warning(f"Error checking storageless node health: {e}")
+        return unhealthy
 
     def retrieve_k8s_pv_names(self) -> set:
         """Return the set of all Kubernetes PersistentVolume names.
@@ -2979,6 +3063,32 @@ def main():
                     ]
                 ))
 
+        # Down/NotReady storageless nodes. These never surface via query_errors
+        # (their pods aren't exec'd) or pxctl status.nodes (storage nodes only),
+        # so report them here. A storageless node still runs Portworx and may host
+        # a KVDB/metadata member, so a down metadata node is escalated to ERROR.
+        storageless_down = stc_data.get('storageless_nodes_down', [])
+        for sd in storageless_down:
+            is_metadata = sd.get('metadata_node', False)
+            level = ValidationLevel.ERROR if is_metadata else ValidationLevel.WARNING
+            role = "metadata/KVDB node" if is_metadata else "storageless node"
+            all_results.append(ValidationResult(
+                level=level,
+                category='Storageless Node Health',
+                message=(
+                    f"Storageless {role} '{sd['node']}' is down/unreachable in Kubernetes "
+                    f"(reason: {sd.get('reason', 'NotReady')})"
+                ),
+                details=sd,
+                recommendations=[
+                    f"Investigate why node '{sd['node']}' is NotReady/unreachable",
+                    "Recover the node (or confirm it is intentionally removed) before migrating",
+                ] + ([
+                    "This node hosts a KVDB/metadata member (px/metadata-node=true); "
+                    "migrating while it is down risks reducing KVDB below quorum",
+                ] if is_metadata else [])
+            ))
+
         # Sanity checks
         logger.info("Running sanity checks...")
         all_results.extend(sanity_checker.check_missing_fields(stc_data))
@@ -4120,6 +4230,25 @@ def main():
             )
         else:
             checks_passed.append("Node Reachability")
+
+        # Storageless node reachability - reported separately from the storage-node
+        # Node Reachability check above (a down storageless node does NOT make
+        # storage-node disk/resource data incomplete, so it must not feed
+        # nodes_unavailable). Only down/NotReady storageless nodes are surfaced.
+        storageless_down_issues = [r for r in all_results if r.category == 'Storageless Node Health']
+        checks_performed.append("Storageless Node Reachability")
+        if storageless_down_issues:
+            n_down = len(storageless_down_issues)
+            if any(r.level in [ValidationLevel.CRITICAL, ValidationLevel.ERROR] for r in storageless_down_issues):
+                checks_failed.append(
+                    f"Storageless Node Reachability ({n_down} node(s) down, incl. metadata/KVDB node)"
+                )
+            else:
+                checks_warning.append(
+                    f"Storageless Node Reachability ({n_down} node(s) down/unreachable)"
+                )
+        else:
+            checks_passed.append("Storageless Node Reachability")
 
         # 0. License Check (critical - must be first)
         license_info = stc_data.get('license', {})

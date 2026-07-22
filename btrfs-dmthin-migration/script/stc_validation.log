@@ -1,0 +1,263 @@
+2026-07-21 12:52:46,069 - INFO - kubectl access validated successfully
+2026-07-21 12:52:46,069 - ERROR - Validation failed: EOF when reading a line
+2026-07-21 12:53:18,893 - INFO - kubectl access validated successfully
+2026-07-21 12:53:18,894 - INFO - Retrieving Portworx data from namespace: portworx
+2026-07-21 12:53:20,742 - INFO - Found 50 ready Portworx pods out of 50 total
+2026-07-21 12:53:20,742 - INFO - Collecting cluster-wide status...
+2026-07-21 12:53:27,871 - WARNING - Failed to parse size: Unavailable Unavailable
+2026-07-21 12:53:27,871 - WARNING - Failed to parse size: Offline Down
+2026-07-21 12:53:27,872 - INFO - Parsed 50 storage nodes from pxctl status
+2026-07-21 12:53:29,394 - INFO - Filtered 50 PX pods → 49 on storage nodes (skipping 1 storageless)
+2026-07-21 12:53:29,394 - INFO - Collecting pool information from 49 pod(s) (parallel, up to 8 concurrent)...
+2026-07-21 12:53:44,880 - INFO -   pool-show progress: 25/49
+2026-07-21 12:53:56,338 - INFO -   pool-show progress: 49/49
+2026-07-21 12:53:56,338 - INFO - Collecting drive information from each node...
+2026-07-21 12:53:59,978 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-l5v4q: 3 drive(s) detected
+2026-07-21 12:54:00,021 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-lgb5p: 3 drive(s) detected
+2026-07-21 12:54:00,026 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-z7rrj: 3 drive(s) detected
+2026-07-21 12:54:00,032 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-zqj5q: 3 drive(s) detected
+2026-07-21 12:54:00,045 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-vtt5f: 3 drive(s) detected
+2026-07-21 12:54:00,049 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-pcljm: 3 drive(s) detected
+2026-07-21 12:54:00,056 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-zlm4j: 3 drive(s) detected
+2026-07-21 12:54:00,093 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-4xgdc: 3 drive(s) detected
+2026-07-21 12:54:03,750 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-p94c4: 3 drive(s) detected
+2026-07-21 12:54:03,862 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-nqbw9: 3 drive(s) detected
+2026-07-21 12:54:03,868 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-bngfw: 3 drive(s) detected
+2026-07-21 12:54:03,868 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-wccz8: 3 drive(s) detected
+2026-07-21 12:54:03,897 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-dgnx2: 3 drive(s) detected
+2026-07-21 12:54:03,901 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-zm4mx: 3 drive(s) detected
+2026-07-21 12:54:03,909 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-rr2bb: 3 drive(s) detected
+2026-07-21 12:54:04,889 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-gtn6r: 3 drive(s) detected
+2026-07-21 12:54:07,593 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-nkhkp: 3 drive(s) detected
+2026-07-21 12:54:07,700 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-kb49l: 3 drive(s) detected
+2026-07-21 12:54:07,704 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-xlpmz: 3 drive(s) detected
+2026-07-21 12:54:07,708 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-6q49z: 3 drive(s) detected
+2026-07-21 12:54:07,717 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-lkvwq: 3 drive(s) detected
+2026-07-21 12:54:07,729 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-rl9sz: 3 drive(s) detected
+2026-07-21 12:54:07,737 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-bxcbr: 3 drive(s) detected
+2026-07-21 12:54:08,715 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-k48m7: 3 drive(s) detected
+2026-07-21 12:54:11,528 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-wnktc: 3 drive(s) detected
+2026-07-21 12:54:11,540 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-9gmz8: 3 drive(s) detected
+2026-07-21 12:54:11,545 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-wkb4w: 3 drive(s) detected
+2026-07-21 12:54:11,558 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-qm9p4: 3 drive(s) detected
+2026-07-21 12:54:11,592 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-l9tph: 3 drive(s) detected
+2026-07-21 12:54:11,614 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-52g2p: 3 drive(s) detected
+2026-07-21 12:54:11,643 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-dzssv: 3 drive(s) detected
+2026-07-21 12:54:12,526 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-xt7m7: 3 drive(s) detected
+2026-07-21 12:54:15,239 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-dmk2s: 3 drive(s) detected
+2026-07-21 12:54:15,255 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-57ktg: 3 drive(s) detected
+2026-07-21 12:54:15,263 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-x8fzh: 3 drive(s) detected
+2026-07-21 12:54:15,272 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-l594v: 3 drive(s) detected
+2026-07-21 12:54:15,275 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-nf8bz: 3 drive(s) detected
+2026-07-21 12:54:15,282 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-tbrf4: 3 drive(s) detected
+2026-07-21 12:54:15,327 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-nqzxb: 3 drive(s) detected
+2026-07-21 12:54:16,699 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-q4kj5: 3 drive(s) detected
+2026-07-21 12:54:19,375 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-99z9m: 3 drive(s) detected
+2026-07-21 12:54:19,405 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-h8grn: 3 drive(s) detected
+2026-07-21 12:54:19,461 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-z77nr: 3 drive(s) detected
+2026-07-21 12:54:19,462 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-n8pn8: 3 drive(s) detected
+2026-07-21 12:54:19,472 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-hbtf5: 3 drive(s) detected
+2026-07-21 12:54:19,473 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-bqqdv: 3 drive(s) detected
+2026-07-21 12:54:19,494 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-67n7z: 3 drive(s) detected
+2026-07-21 12:54:20,397 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-pn96j: 3 drive(s) detected
+2026-07-21 12:54:23,534 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-nz5tt: 3 drive(s) detected
+2026-07-21 12:54:23,535 - INFO - Collecting node CPU and memory resources...
+2026-07-21 12:54:23,535 - INFO - Retrieving node CPU and memory resources...
+2026-07-21 12:54:25,064 - INFO - Retrieved resource info for 50 nodes
+2026-07-21 12:54:25,064 - INFO - Collecting volume attachments per node...
+2026-07-21 12:54:25,064 - INFO - Retrieving volume attachments per node...
+2026-07-21 12:54:26,798 - INFO - Retrieved volume attachment info for 0 nodes
+2026-07-21 12:54:28,658 - INFO - Found 12 Kubernetes PersistentVolume(s)
+2026-07-21 12:54:28,659 - INFO - Checking for manually attached volumes...
+2026-07-21 12:54:32,480 - INFO - Found 0 PX volume(s) in attached state
+2026-07-21 12:54:37,593 - INFO - No PVCs referenced by running/pending pods
+2026-07-21 12:54:41,380 - INFO - Found 6 PX volume(s) with HA info
+2026-07-21 12:54:41,381 - INFO - Successfully retrieved and parsed Portworx data
+2026-07-21 12:54:41,382 - INFO - Running sanity checks...
+2026-07-21 12:54:41,382 - INFO - Analyzing capacity requirements...
+2026-07-21 12:54:41,382 - INFO - Checking metadata consistency...
+2026-07-21 12:54:41,382 - INFO - Retrieving Kubernetes node labels...
+2026-07-21 12:54:41,382 - INFO - Retrieving Kubernetes node labels...
+2026-07-21 12:54:41,382 - INFO - Retrieving nodes where Portworx is running...
+2026-07-21 12:54:42,830 - INFO - Found 50 nodes running Portworx
+2026-07-21 12:54:44,309 - INFO - Retrieved labels for 50 Kubernetes nodes (Portworx nodes)
+2026-07-21 12:54:44,309 - INFO - Retrieving StorageCluster spec...
+2026-07-21 12:54:44,309 - INFO - Retrieving StorageCluster spec from namespace: portworx
+2026-07-21 12:54:45,700 - INFO - Successfully retrieved StorageCluster spec
+2026-07-21 12:54:45,712 - INFO - Validating pool configurations...
+2026-07-21 12:54:45,712 - INFO - Validating cloud storage drive types...
+2026-07-21 12:54:45,712 - INFO - Generating migration readiness report...
+2026-07-21 13:04:00,480 - INFO - kubectl access validated successfully
+2026-07-21 13:04:00,480 - INFO - Retrieving Portworx data from namespace: portworx
+2026-07-21 13:04:02,220 - INFO - Found 50 ready Portworx pods out of 50 total
+2026-07-21 13:04:02,221 - INFO - Collecting cluster-wide status...
+2026-07-21 13:04:09,232 - WARNING - Failed to parse size: Unavailable Unavailable
+2026-07-21 13:04:09,232 - WARNING - Failed to parse size: Offline Down
+2026-07-21 13:04:09,232 - INFO - Parsed 50 storage nodes from pxctl status
+2026-07-21 13:04:10,801 - INFO - Filtered 50 PX pods → 49 on storage nodes (skipping 1 storageless)
+2026-07-21 13:04:10,801 - INFO - Collecting pool information from 49 pod(s) (parallel, up to 8 concurrent)...
+2026-07-21 13:04:25,212 - INFO -   pool-show progress: 25/49
+2026-07-21 13:04:36,138 - INFO -   pool-show progress: 49/49
+2026-07-21 13:04:36,138 - INFO - Collecting drive information from each node...
+2026-07-21 13:04:39,926 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-z7rrj: 3 drive(s) detected
+2026-07-21 13:04:39,953 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-zlm4j: 3 drive(s) detected
+2026-07-21 13:04:39,969 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-vtt5f: 3 drive(s) detected
+2026-07-21 13:04:39,987 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-pcljm: 3 drive(s) detected
+2026-07-21 13:04:40,048 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-4xgdc: 3 drive(s) detected
+2026-07-21 13:04:40,056 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-l5v4q: 3 drive(s) detected
+2026-07-21 13:04:40,060 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-lgb5p: 3 drive(s) detected
+2026-07-21 13:04:40,066 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-zqj5q: 3 drive(s) detected
+2026-07-21 13:04:43,564 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-p94c4: 3 drive(s) detected
+2026-07-21 13:04:44,257 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-gtn6r: 3 drive(s) detected
+2026-07-21 13:04:44,260 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-rr2bb: 3 drive(s) detected
+2026-07-21 13:04:44,272 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-wccz8: 3 drive(s) detected
+2026-07-21 13:04:44,276 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-nqbw9: 3 drive(s) detected
+2026-07-21 13:04:44,279 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-zm4mx: 3 drive(s) detected
+2026-07-21 13:04:44,284 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-bngfw: 3 drive(s) detected
+2026-07-21 13:04:44,293 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-dgnx2: 3 drive(s) detected
+2026-07-21 13:04:48,587 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-lkvwq: 3 drive(s) detected
+2026-07-21 13:04:48,651 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-xlpmz: 3 drive(s) detected
+2026-07-21 13:04:48,655 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-nkhkp: 3 drive(s) detected
+2026-07-21 13:04:48,776 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-k48m7: 3 drive(s) detected
+2026-07-21 13:04:48,871 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-rl9sz: 3 drive(s) detected
+2026-07-21 13:04:48,939 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-bxcbr: 3 drive(s) detected
+2026-07-21 13:04:48,942 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-6q49z: 3 drive(s) detected
+2026-07-21 13:04:48,945 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-kb49l: 3 drive(s) detected
+2026-07-21 13:04:52,686 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-wkb4w: 3 drive(s) detected
+2026-07-21 13:04:53,070 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-l9tph: 3 drive(s) detected
+2026-07-21 13:04:53,076 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-wnktc: 3 drive(s) detected
+2026-07-21 13:04:53,266 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-dzssv: 3 drive(s) detected
+2026-07-21 13:04:53,365 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-xt7m7: 3 drive(s) detected
+2026-07-21 13:04:53,379 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-qm9p4: 3 drive(s) detected
+2026-07-21 13:04:53,383 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-52g2p: 3 drive(s) detected
+2026-07-21 13:04:54,076 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-9gmz8: 3 drive(s) detected
+2026-07-21 13:04:56,598 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-l594v: 3 drive(s) detected
+2026-07-21 13:04:57,004 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-tbrf4: 3 drive(s) detected
+2026-07-21 13:04:57,047 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-dmk2s: 3 drive(s) detected
+2026-07-21 13:04:57,077 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-57ktg: 3 drive(s) detected
+2026-07-21 13:04:57,252 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-x8fzh: 3 drive(s) detected
+2026-07-21 13:04:57,256 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-nqzxb: 3 drive(s) detected
+2026-07-21 13:04:57,346 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-nf8bz: 3 drive(s) detected
+2026-07-21 13:04:57,804 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-q4kj5: 3 drive(s) detected
+2026-07-21 13:05:00,350 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-67n7z: 3 drive(s) detected
+2026-07-21 13:05:00,895 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-n8pn8: 3 drive(s) detected
+2026-07-21 13:05:00,906 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-99z9m: 3 drive(s) detected
+2026-07-21 13:05:00,908 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-hbtf5: 3 drive(s) detected
+2026-07-21 13:05:01,135 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-h8grn: 3 drive(s) detected
+2026-07-21 13:05:01,144 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-bqqdv: 3 drive(s) detected
+2026-07-21 13:05:01,145 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-z77nr: 3 drive(s) detected
+2026-07-21 13:05:01,631 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-pn96j: 3 drive(s) detected
+2026-07-21 13:05:04,108 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-nz5tt: 3 drive(s) detected
+2026-07-21 13:05:04,108 - INFO - Collecting node CPU and memory resources...
+2026-07-21 13:05:04,108 - INFO - Retrieving node CPU and memory resources...
+2026-07-21 13:05:05,749 - INFO - Retrieved resource info for 50 nodes
+2026-07-21 13:05:05,749 - INFO - Collecting volume attachments per node...
+2026-07-21 13:05:05,750 - INFO - Retrieving volume attachments per node...
+2026-07-21 13:05:07,484 - INFO - Retrieved volume attachment info for 0 nodes
+2026-07-21 13:05:08,761 - INFO - Found 12 Kubernetes PersistentVolume(s)
+2026-07-21 13:05:08,761 - INFO - Checking for manually attached volumes...
+2026-07-21 13:05:12,877 - INFO - Found 0 PX volume(s) in attached state
+2026-07-21 13:05:17,732 - INFO - No PVCs referenced by running/pending pods
+2026-07-21 13:05:21,407 - INFO - Found 6 PX volume(s) with HA info
+2026-07-21 13:05:21,407 - INFO - Successfully retrieved and parsed Portworx data
+2026-07-21 13:05:21,407 - INFO - Running sanity checks...
+2026-07-21 13:05:21,407 - INFO - Analyzing capacity requirements...
+2026-07-21 13:05:21,407 - INFO - Checking metadata consistency...
+2026-07-21 13:05:21,408 - INFO - Retrieving Kubernetes node labels...
+2026-07-21 13:05:21,408 - INFO - Retrieving Kubernetes node labels...
+2026-07-21 13:05:21,408 - INFO - Retrieving nodes where Portworx is running...
+2026-07-21 13:05:22,854 - INFO - Found 50 nodes running Portworx
+2026-07-21 13:05:24,328 - INFO - Retrieved labels for 50 Kubernetes nodes (Portworx nodes)
+2026-07-21 13:05:24,328 - INFO - Retrieving StorageCluster spec...
+2026-07-21 13:05:24,328 - INFO - Retrieving StorageCluster spec from namespace: portworx
+2026-07-21 13:05:25,580 - INFO - Successfully retrieved StorageCluster spec
+2026-07-21 13:05:25,589 - INFO - Validating pool configurations...
+2026-07-21 13:05:25,590 - INFO - Validating cloud storage drive types...
+2026-07-21 13:05:25,590 - INFO - Generating migration readiness report...
+2026-07-21 13:06:46,923 - INFO - kubectl access validated successfully
+2026-07-21 13:06:46,924 - INFO - Retrieving Portworx data from namespace: portworx
+2026-07-21 13:06:48,357 - INFO - Found 50 ready Portworx pods out of 50 total
+2026-07-21 13:06:48,358 - INFO - Collecting cluster-wide status...
+2026-07-21 13:06:55,426 - WARNING - Failed to parse size: Unavailable Unavailable
+2026-07-21 13:06:55,426 - WARNING - Failed to parse size: Offline Down
+2026-07-21 13:06:55,427 - INFO - Parsed 50 storage nodes from pxctl status
+2026-07-21 13:06:56,939 - INFO - Filtered 50 PX pods → 49 on storage nodes (skipping 1 storageless)
+2026-07-21 13:06:56,939 - INFO - Collecting pool information from 49 pod(s) (parallel, up to 8 concurrent)...
+2026-07-21 13:07:12,781 - INFO -   pool-show progress: 25/49
+2026-07-21 13:07:23,849 - INFO -   pool-show progress: 49/49
+2026-07-21 13:07:23,850 - INFO - Collecting drive information from each node...
+2026-07-21 13:07:28,105 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-z7rrj: 3 drive(s) detected
+2026-07-21 13:07:28,125 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-zlm4j: 3 drive(s) detected
+2026-07-21 13:07:28,178 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-4xgdc: 3 drive(s) detected
+2026-07-21 13:07:28,184 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-vtt5f: 3 drive(s) detected
+2026-07-21 13:07:28,221 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-l5v4q: 3 drive(s) detected
+2026-07-21 13:07:28,285 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-pcljm: 3 drive(s) detected
+2026-07-21 13:07:28,296 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-lgb5p: 3 drive(s) detected
+2026-07-21 13:07:28,344 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-zqj5q: 3 drive(s) detected
+2026-07-21 13:07:31,825 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-gtn6r: 3 drive(s) detected
+2026-07-21 13:07:31,831 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-p94c4: 3 drive(s) detected
+2026-07-21 13:07:31,919 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-rr2bb: 3 drive(s) detected
+2026-07-21 13:07:31,935 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-zm4mx: 3 drive(s) detected
+2026-07-21 13:07:31,945 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-nqbw9: 3 drive(s) detected
+2026-07-21 13:07:31,970 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-wccz8: 3 drive(s) detected
+2026-07-21 13:07:32,061 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-dgnx2: 3 drive(s) detected
+2026-07-21 13:07:32,991 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-bngfw: 3 drive(s) detected
+2026-07-21 13:07:35,390 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-xlpmz: 3 drive(s) detected
+2026-07-21 13:07:35,431 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-rl9sz: 3 drive(s) detected
+2026-07-21 13:07:35,456 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-nkhkp: 3 drive(s) detected
+2026-07-21 13:07:35,462 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-lkvwq: 3 drive(s) detected
+2026-07-21 13:07:35,493 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-bxcbr: 3 drive(s) detected
+2026-07-21 13:07:35,527 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-kb49l: 3 drive(s) detected
+2026-07-21 13:07:35,603 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-6q49z: 3 drive(s) detected
+2026-07-21 13:07:36,566 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-k48m7: 3 drive(s) detected
+2026-07-21 13:07:39,108 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-9gmz8: 3 drive(s) detected
+2026-07-21 13:07:39,130 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-qm9p4: 3 drive(s) detected
+2026-07-21 13:07:39,142 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-wnktc: 3 drive(s) detected
+2026-07-21 13:07:39,147 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-l9tph: 3 drive(s) detected
+2026-07-21 13:07:39,161 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-dzssv: 3 drive(s) detected
+2026-07-21 13:07:39,216 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-52g2p: 3 drive(s) detected
+2026-07-21 13:07:40,052 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-wkb4w: 3 drive(s) detected
+2026-07-21 13:07:40,246 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-xt7m7: 3 drive(s) detected
+2026-07-21 13:07:42,730 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-tbrf4: 3 drive(s) detected
+2026-07-21 13:07:42,774 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-dmk2s: 3 drive(s) detected
+2026-07-21 13:07:42,776 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-l594v: 3 drive(s) detected
+2026-07-21 13:07:42,802 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-57ktg: 3 drive(s) detected
+2026-07-21 13:07:42,922 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-x8fzh: 3 drive(s) detected
+2026-07-21 13:07:42,930 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-nqzxb: 3 drive(s) detected
+2026-07-21 13:07:43,673 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-nf8bz: 3 drive(s) detected
+2026-07-21 13:07:43,847 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-q4kj5: 3 drive(s) detected
+2026-07-21 13:07:46,360 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-67n7z: 3 drive(s) detected
+2026-07-21 13:07:46,369 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-hbtf5: 3 drive(s) detected
+2026-07-21 13:07:46,409 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-n8pn8: 3 drive(s) detected
+2026-07-21 13:07:46,413 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-99z9m: 3 drive(s) detected
+2026-07-21 13:07:46,631 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-bqqdv: 3 drive(s) detected
+2026-07-21 13:07:46,634 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-h8grn: 3 drive(s) detected
+2026-07-21 13:07:47,381 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-z77nr: 3 drive(s) detected
+2026-07-21 13:07:47,504 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-pn96j: 3 drive(s) detected
+2026-07-21 13:07:50,089 - INFO - Node pwx-ocp-33-13-cptlc-worker-0-nz5tt: 3 drive(s) detected
+2026-07-21 13:07:50,091 - INFO - Collecting node CPU and memory resources...
+2026-07-21 13:07:50,091 - INFO - Retrieving node CPU and memory resources...
+2026-07-21 13:07:51,617 - INFO - Retrieved resource info for 50 nodes
+2026-07-21 13:07:51,618 - INFO - Collecting volume attachments per node...
+2026-07-21 13:07:51,618 - INFO - Retrieving volume attachments per node...
+2026-07-21 13:07:53,386 - INFO - Retrieved volume attachment info for 0 nodes
+2026-07-21 13:07:54,705 - INFO - Found 12 Kubernetes PersistentVolume(s)
+2026-07-21 13:07:54,705 - INFO - Checking for manually attached volumes...
+2026-07-21 13:07:58,412 - INFO - Found 0 PX volume(s) in attached state
+2026-07-21 13:08:03,159 - INFO - No PVCs referenced by running/pending pods
+2026-07-21 13:08:07,330 - INFO - Found 6 PX volume(s) with HA info
+2026-07-21 13:08:07,330 - INFO - Successfully retrieved and parsed Portworx data
+2026-07-21 13:08:07,330 - INFO - Running sanity checks...
+2026-07-21 13:08:07,330 - INFO - Analyzing capacity requirements...
+2026-07-21 13:08:07,330 - INFO - Checking metadata consistency...
+2026-07-21 13:08:07,330 - INFO - Retrieving Kubernetes node labels...
+2026-07-21 13:08:07,330 - INFO - Retrieving Kubernetes node labels...
+2026-07-21 13:08:07,331 - INFO - Retrieving nodes where Portworx is running...
+2026-07-21 13:08:09,114 - INFO - Found 50 nodes running Portworx
+2026-07-21 13:08:11,111 - INFO - Retrieved labels for 50 Kubernetes nodes (Portworx nodes)
+2026-07-21 13:08:11,111 - INFO - Retrieving StorageCluster spec...
+2026-07-21 13:08:11,111 - INFO - Retrieving StorageCluster spec from namespace: portworx
+2026-07-21 13:08:12,508 - INFO - Successfully retrieved StorageCluster spec
+2026-07-21 13:08:12,518 - INFO - Validating pool configurations...
+2026-07-21 13:08:12,518 - INFO - Validating cloud storage drive types...
+2026-07-21 13:08:12,518 - INFO - Generating migration readiness report...
