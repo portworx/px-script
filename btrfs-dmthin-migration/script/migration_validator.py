@@ -572,48 +572,75 @@ class STCDataRetriever:
         return data
 
     def parse_pxctl_drive_show(self, pxctl_output: str) -> Dict[str, Any]:
-        """Parse pxctl service drive show output to get drive information"""
+        """Parse pxctl service drive show output to count pool DATA drives.
+
+        Only drives listed under a pool's "Drives:" section are counted. The
+        Journal device, Cache drives and KVDB/metadata devices are deliberately
+        excluded: they are not data-drive slots the StoreV2 migration plans
+        against, and counting them (the journal in particular, which is often a
+        second partition of a data disk) previously inflated the per-node total
+        past the max-drives cap and produced negative "available slots".
+
+        Section-aware so it works for any number of pools per node. If the output
+        has no recognisable pool structure at all (older/flat formats), it falls
+        back to counting device lines that aren't inside an excluded section so we
+        never regress to a zero count.
+        """
         drive_info = {
             'total_drives': 0,
             'drives': [],
-            'pool_drive_counts': {}  # Pool ID -> drive count
+            'pool_drive_counts': {}  # "pool-<id>" -> data drive count
         }
 
-        lines = pxctl_output.split('\n')
-        
-        for line in lines:
+        current_pool_id = None
+        # When True we're inside a section whose device lines must NOT be counted
+        # as data drives (Journal / Cache / KVDB / Metadata / LastOperation).
+        skip_section = False
+
+        for line in pxctl_output.split('\n'):
             line = line.strip()
             if not line:
                 continue
-                
-            # Look for drive entries - typically formatted as:
-            # /dev/sdb or similar device paths, or table rows with drive info
-            # Common format: "Device   Path   Pool ID   ..."
-            # Or: "/dev/sdb   150 GiB   0   Online"
-            
-            # Skip header lines
+
+            # A pool's data drives live under "Drives:"; a new "Pool ID:" also
+            # returns us to countable context. Any of the excluded headers below
+            # switches counting off until the next pool/Drives header.
+            if line.startswith('Pool ID:'):
+                current_pool_id = line.split(':', 1)[1].strip().split()[0]
+                skip_section = False
+                continue
+            if line.startswith('Drives:'):
+                skip_section = False
+                continue
+            if (line.startswith('Journal Device') or line.startswith('Cache Drives')
+                    or line.startswith('KVDB') or line.startswith('Metadata Device')
+                    or line.startswith('System Metadata') or line.startswith('LastOperation')):
+                skip_section = True
+                continue
+
+            if skip_section:
+                continue
+
+            # Skip tabular header/separator lines (older flat formats).
             if line.startswith('Device') or line.startswith('Path') or line.startswith('-'):
                 continue
-            
-            # Check if line contains a device path (starts with /dev/ or contains drive info)
-            if '/dev/' in line or line.startswith('Drive'):
+
+            if '/dev/' in line:
+                # e.g. "2: /dev/sde, Total size 2.9 TiB, Online"
+                dev = None
+                for part in line.split():
+                    if part.startswith('/dev/'):
+                        dev = part.rstrip(',')
+                        break
+                if dev is None:
+                    continue
+
                 drive_info['total_drives'] += 1
-                
-                # Try to extract pool ID from the line
-                parts = line.split()
-                for i, part in enumerate(parts):
-                    if part.isdigit() and i > 0:  # Pool ID is usually a small number
-                        pool_id = part
-                        if pool_id not in drive_info['pool_drive_counts']:
-                            drive_info['pool_drive_counts'][pool_id] = 0
-                        drive_info['pool_drive_counts'][pool_id] += 1
-                        break
-                
-                # Store drive path
-                for part in parts:
-                    if '/dev/' in part:
-                        drive_info['drives'].append(part)
-                        break
+                drive_info['drives'].append(dev)
+                pool_key = f"pool-{current_pool_id}" if current_pool_id is not None else 'unknown'
+                drive_info['pool_drive_counts'][pool_key] = (
+                    drive_info['pool_drive_counts'].get(pool_key, 0) + 1
+                )
 
         return drive_info
 
@@ -665,6 +692,14 @@ class STCDataRetriever:
         lines = pxctl_output.split('\n')
         current_pool_id = None
         current_pool = {}
+        # A pool block contains a real "Status: Online" line AND a nested
+        # "LastOperation" section that ALSO has a "Status:" line (e.g.
+        # OPERATION_SUCCESSFUL / OPERATION_FAILED). Those are the result of the
+        # last pool operation, NOT the pool's health, so we must not let them
+        # overwrite the pool status. This flag tracks when we're inside that
+        # nested section. It resets on every new pool, so it works for any
+        # number of pools per node.
+        in_last_operation = False
 
         for line in lines:
             line = line.strip()
@@ -682,6 +717,13 @@ class STCDataRetriever:
                     'driveType': 'SSD',  # Default
                     'labels': {}
                 }
+                in_last_operation = False
+
+            elif line.startswith('LastOperation') and current_pool:
+                # Entering the nested last-operation section (header has no colon,
+                # e.g. "LastOperation  OPERATION_RESIZE"). Its "Status:" line is the
+                # operation result, not the pool health, so flag it to be ignored.
+                in_last_operation = True
 
             elif line.startswith('IO Priority:') and current_pool:
                 current_pool['priority'] = line.split(':', 1)[1].strip().lower()
@@ -701,8 +743,12 @@ class STCDataRetriever:
                         'total': self._parse_size(f"{size_parts[0]} {size_parts[1]}")
                     }
 
-            elif line.startswith('Status:') and current_pool:
-                current_pool['status'] = line.split(':')[1].strip()
+            elif line.startswith('Status:') and current_pool and not in_last_operation:
+                # The pool's real health status (e.g. Online). It always appears
+                # before the LastOperation section; once we're inside that section
+                # its "Status:" line (OPERATION_SUCCESSFUL/FAILED) is ignored, so
+                # this captures the pool status correctly for any number of pools.
+                current_pool['status'] = line.split(':', 1)[1].strip()
 
             elif line.startswith('Used:') and current_pool:
                 used_parts = line.split(':')[1].strip().split()
@@ -942,6 +988,12 @@ class STCDataRetriever:
             # Only the down nodes are recorded; healthy storageless nodes are omitted.
             logger.info("Checking storageless node health...")
             stc_data['storageless_nodes_down'] = self.retrieve_unhealthy_storageless_nodes(px_nodes)
+
+            # Detect cordoned (SchedulingDisabled) PX nodes. A cordoned node stays
+            # Ready in k8s and Online in pxctl, so no other check catches it, yet it
+            # blocks a rolling migration (cannot receive rescheduled pods).
+            logger.info("Checking for cordoned nodes...")
+            stc_data['cordoned_nodes'] = self.retrieve_cordoned_nodes()
 
             # Collect volume attachments per node
             logger.info("Collecting volume attachments per node...")
@@ -1277,6 +1329,53 @@ class STCDataRetriever:
         except Exception as e:
             logger.warning(f"Error checking storageless node health: {e}")
         return unhealthy
+
+    def retrieve_cordoned_nodes(self) -> List[str]:
+        """Return Portworx nodes that are cordoned (spec.unschedulable=true) in k8s.
+
+        Only nodes where Portworx is actually running are considered. This is a
+        cross-cutting concern that the pxctl-based reachability check cannot catch:
+        a cordoned node stays Ready in k8s and Online in pxctl, so nothing else
+        surfaces it. A cordoned PX node blocks a rolling StoreV2 migration because
+        it cannot receive rescheduled pods while nodes are drained/restarted, so it
+        is reported as a blocker upstream.
+
+        Returns a sorted list of cordoned PX node names (empty if none/on error).
+        """
+        cordoned = []
+        try:
+            px_nodes = set(self.retrieve_portworx_nodes())
+            if not px_nodes:
+                return cordoned
+
+            cmd = self._kubectl_base() + ['get', 'nodes', '-o', 'json']
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30
+            )
+            nodes_data = json.loads(result.stdout)
+
+            for node in nodes_data.get('items', []):
+                name = node.get('metadata', {}).get('name', '')
+                # spec.unschedulable is True only when cordoned; absent/False otherwise.
+                if name in px_nodes and node.get('spec', {}).get('unschedulable') is True:
+                    cordoned.append(name)
+
+            if cordoned:
+                logger.warning(
+                    f"Detected {len(cordoned)} cordoned Portworx node(s): "
+                    f"{', '.join(cordoned)}"
+                )
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Failed to check cordoned nodes: {e.stderr}")
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse node JSON for cordon check: {e}")
+        except Exception as e:
+            logger.warning(f"Error checking cordoned nodes: {e}")
+        return sorted(cordoned)
 
     def retrieve_k8s_pv_names(self) -> set:
         """Return the set of all Kubernetes PersistentVolume names.
@@ -3066,14 +3165,14 @@ def main():
         # Down/NotReady storageless nodes. These never surface via query_errors
         # (their pods aren't exec'd) or pxctl status.nodes (storage nodes only),
         # so report them here. A storageless node still runs Portworx and may host
-        # a KVDB/metadata member, so a down metadata node is escalated to ERROR.
+        # a KVDB/metadata member, so a down node blocks migration (CRITICAL) just
+        # like a down storage node (see the query_errors block above).
         storageless_down = stc_data.get('storageless_nodes_down', [])
         for sd in storageless_down:
             is_metadata = sd.get('metadata_node', False)
-            level = ValidationLevel.ERROR if is_metadata else ValidationLevel.WARNING
             role = "metadata/KVDB node" if is_metadata else "storageless node"
             all_results.append(ValidationResult(
-                level=level,
+                level=ValidationLevel.CRITICAL,
                 category='Storageless Node Health',
                 message=(
                     f"Storageless {role} '{sd['node']}' is down/unreachable in Kubernetes "
@@ -3087,6 +3186,26 @@ def main():
                     "This node hosts a KVDB/metadata member (px/metadata-node=true); "
                     "migrating while it is down risks reducing KVDB below quorum",
                 ] if is_metadata else [])
+            ))
+
+        # Cordoned (SchedulingDisabled) PX nodes block migration. A cordoned node
+        # cannot receive rescheduled pods while nodes are drained/restarted during
+        # the rolling StoreV2 migration, so this is a CRITICAL blocker.
+        cordoned_nodes = stc_data.get('cordoned_nodes', [])
+        for node_name in cordoned_nodes:
+            all_results.append(ValidationResult(
+                level=ValidationLevel.CRITICAL,
+                category='Node Schedulability',
+                message=(
+                    f"Node '{node_name}' is cordoned (SchedulingDisabled) in Kubernetes "
+                    f"while Portworx is running on it"
+                ),
+                details={'node': node_name, 'unschedulable': True},
+                recommendations=[
+                    f"Uncordon the node before migrating: kubectl uncordon {node_name}",
+                    "A cordoned node cannot receive rescheduled pods during the rolling "
+                    "migration, which can stall node drains/restarts",
+                ]
             ))
 
         # Sanity checks
@@ -4234,21 +4353,29 @@ def main():
         # Storageless node reachability - reported separately from the storage-node
         # Node Reachability check above (a down storageless node does NOT make
         # storage-node disk/resource data incomplete, so it must not feed
-        # nodes_unavailable). Only down/NotReady storageless nodes are surfaced.
+        # nodes_unavailable). Only down/NotReady storageless nodes are surfaced,
+        # and a down node blocks migration (FAILED) just like a down storage node.
         storageless_down_issues = [r for r in all_results if r.category == 'Storageless Node Health']
         checks_performed.append("Storageless Node Reachability")
         if storageless_down_issues:
-            n_down = len(storageless_down_issues)
-            if any(r.level in [ValidationLevel.CRITICAL, ValidationLevel.ERROR] for r in storageless_down_issues):
-                checks_failed.append(
-                    f"Storageless Node Reachability ({n_down} node(s) down, incl. metadata/KVDB node)"
-                )
-            else:
-                checks_warning.append(
-                    f"Storageless Node Reachability ({n_down} node(s) down/unreachable)"
-                )
+            checks_failed.append(
+                f"Storageless Node Reachability ({len(storageless_down_issues)} node(s) down/unreachable)"
+            )
         else:
             checks_passed.append("Storageless Node Reachability")
+
+        # Node schedulability - cordoned PX nodes block a rolling migration. Kept
+        # separate from nodes_unavailable (a cordoned node is Ready/Online, so it
+        # doesn't make storage disk/resource data incomplete). Any cordoned PX node
+        # is a FAILED/blocker.
+        cordoned_nodes = stc_data.get('cordoned_nodes', [])
+        checks_performed.append("Node Schedulability")
+        if cordoned_nodes:
+            checks_failed.append(
+                f"Node Schedulability ({len(cordoned_nodes)} node(s) cordoned)"
+            )
+        else:
+            checks_passed.append("Node Schedulability")
 
         # 0. License Check (critical - must be first)
         license_info = stc_data.get('license', {})
